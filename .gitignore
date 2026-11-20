@@ -51,3 +51,8 @@ C:/
 
 # image-network model files (large; kept with the ML data, see netscreen.py in afylab/flakeid-designer)
 models/
+
+# the glovebox PC: its own settings (calibration of that microscope), made by tools/bx53m/run_flakeid.bat
+/scan_settings.json
+# written by the Tango stage library in the folder the program runs from
+tango_dll_errlog.txt

@@ -26,6 +26,10 @@ def launched_directly():
     import os
     if sys.platform != "win32" or os.environ.get("FLAKEID_ORIG_PATH"):
         return None
+    if "--hw" in sys.argv[1:] and sys.stdout is not None:
+        # (another microscope's PC, started from a console with its own Python: its PATH and packages as they are.
+        # PYTHONNOUSERSITE here hid the packages of the user's site from the analysis process: no cv2, 2026-11-13)
+        return None
     exe = Path(sys.executable).parent
     sysroot = os.environ.get("SystemRoot", r"C:\Windows")
     os.environ["FLAKEID_ORIG_PATH"] = os.environ.get("PATH", "")
@@ -124,6 +128,14 @@ def make_core(mm, cfg, log=print, corelog=None):
         except Exception as e:
             log(f"(Micro-Manager log not redirected: {e})")
     return core
+
+
+def make_direct_core(s):
+    """The microscope without Micro-Manager (setting hardware, e.g. "bx53m"): its own core, nothing opened yet."""
+    if s.hardware == "bx53m":
+        from .hw.bx53m import make_core as mk
+        return mk(s)
+    raise RuntimeError(f"unknown hardware {s.hardware!r}")
 
 
 # one scan program at a time: a second one would wait for ever loading the microscope the first one holds (e.g. one
@@ -225,6 +237,8 @@ def main(argv=None):
 
 def _main(argv=None):
     ap = argparse.ArgumentParser(prog="python -m flakeid.scope", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--hw", choices=["mm", "bx53m"], help="the microscope (setting hardware): mm = through Micro-Manager "
+                    "(--mm, --cfg); bx53m = the glovebox BX53M through the vendors' libraries (flakeid/scope/hw)")
     ap.add_argument("--mm", help="Micro-Manager install folder (device drivers)")
     ap.add_argument("--cfg", help="hardware configuration (.cfg)")
     ap.add_argument("--settings", help="JSON file overriding settings (flakeid/scope/settings.py)")
@@ -244,7 +258,7 @@ def _main(argv=None):
                          "read as JSON when it can be (numbers, true/false, lists), else as text")
     a = ap.parse_args(argv)
     from .settings import dump, load
-    ov = dict(mode=a.mode, run_dir=a.run_dir, results_dir=a.results, copy_results_to=a.share, targets_csv=a.targets, focus_mode=a.focus)
+    ov = dict(hardware=a.hw, mode=a.mode, run_dir=a.run_dir, results_dir=a.results, copy_results_to=a.share, targets_csv=a.targets, focus_mode=a.focus)
     if a.name:
         ov["run_name" if (a.mode or "multi") == "multi" else "name"] = a.name
     if a.no_analysis:
@@ -262,11 +276,19 @@ def _main(argv=None):
         ov["ask_mode"] = True               # (the desktop shortcut: a start screen chooses scan / flat field / capture)
     print(f"flakeid.scope: python {sys.version.split()[0]}, settings {a.settings}", flush=True)
     s = load(a.settings, **ov)
+    # (the 100x objective's ratio and offset for everything imported from here on, and for the analysis process:
+    # flakeid/hwconst.py)
+    import os as _os
+    _os.environ["FLAKEID_RATIO_100X"] = repr(float(s.ratio_100x))
+    _os.environ["FLAKEID_OFFSET_100X"] = f"{float(s.offset_100x_um[0])!r},{float(s.offset_100x_um[1])!r}"
     if a.print_settings:
         print(json.dumps(dump(s), indent=1))
         return 0
-    if not (a.mm and a.cfg):
-        ap.error("--mm and --cfg are needed")
+    direct = s.hardware != "mm"                         # (no Micro-Manager: the vendors' libraries, flakeid/scope/hw)
+    if direct:
+        a.cfg = a.cfg or f"{s.hardware} (flakeid.scope.hw)"
+    elif not (a.mm and a.cfg):
+        ap.error("--mm and --cfg are needed (or --hw bx53m)")
     from .scan import Scanner
     import os
     wait = os.environ.pop("FLAKEID_WAIT_PID", "")      # (restarted after an update: the old program ends first)
@@ -288,7 +310,11 @@ def _main(argv=None):
         corelog = None
     if a.headless:
         print(f"loading the microscope ({a.cfg}) ...", flush=True)
-        core = load_core(a.mm, a.cfg, corelog=corelog)
+        if direct:
+            core = make_direct_core(s)
+            core.loadSystemConfiguration(a.cfg)
+        else:
+            core = load_core(a.mm, a.cfg, corelog=corelog)
         print("microscope ready", flush=True)
         from .ui import AutoUI
         ui = AutoUI(core, analysis=s.local_analysis)
@@ -296,7 +322,7 @@ def _main(argv=None):
     else:
         # the devices are opened only while a job or the start screen's live view uses them (microscope.py): the start
         # screen holds nothing, so Stream Motion can use the camera and the stage meanwhile
-        if not Path(a.cfg).is_file():
+        if not direct and not Path(a.cfg).is_file():
             raise RuntimeError(f"the microscope's configuration {a.cfg} does not exist")
         try:                                            # (the previous session's logs, a crash's too, to GitHub; read
             from . import logupload                     # before Micro-Manager starts its log afresh)
@@ -305,7 +331,7 @@ def _main(argv=None):
             logupload.upload_later(s, "start")
         except Exception as e:
             print(f"(logs not copied to GitHub: {e})", flush=True)
-        core = make_core(a.mm, a.cfg, corelog=corelog)
+        core = make_direct_core(s) if direct else make_core(a.mm, a.cfg, corelog=corelog)
         print(f"microscope configuration {a.cfg}: connected when a job starts", flush=True)
         from .microscope import Microscope
         from .ui import TkUI

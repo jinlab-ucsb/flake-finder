@@ -14,6 +14,8 @@ is this script's own, targets come from a CSV.
 """
 from __future__ import annotations
 
+from flakeid.hwconst import OFFSET_100X, RATIO_100X  # noqa: F401  (the microscope's 100x ratio and offset)
+
 import csv
 import datetime
 import json
@@ -506,11 +508,41 @@ def intersect(a, b):
     return ((ca * b[3] - a[3] * cb) / det, (a[2] * cb - ca * b[2]) / det)
 
 
-def idw_offset(x, y, pts):
-    """Distance-weighted mean of the third column of pts at (x, y) (1 mm softening)."""
+def idw_offset(x, y, pts, now=None, half_life_s=0.0, rate=0.0):
+    """Distance-weighted mean of the third column of pts at (x, y) (1 mm softening).  Points with a fourth column (the
+    time they were measured, s) and now: each brought forward by rate (um/s, the focus drift: drift_rate) to now, and
+    with half_life_s > 0 weighted down by age as well (half the weight per half_life_s), so that over a long run the
+    flakes focused last count most."""
     P = np.asarray(pts, float)
     w = 1.0 / ((P[:, 0] - x) ** 2 + (P[:, 1] - y) ** 2 + 1.0e6)
-    return float((w * P[:, 2]).sum() / w.sum())
+    v = P[:, 2]
+    if now is not None and P.shape[1] >= 4:
+        age = np.maximum(now - P[:, 3], 0.0)
+        v = v + rate * age
+        if half_life_s > 0:
+            w = w * 0.5 ** (age / half_life_s)
+    return float((w * v).sum() / w.sum())
+
+
+def drift_rate(pts, now, window_s=1800.0, min_n=8, min_span_s=300.0, max_um_h=10.0):
+    """The focus drift (um/s) from the 100x - 10x offsets [(x, y, offset, time)] of the last window_s: the slope of a
+    straight line through offset against time (Theil-Sen: the median of the pairs' slopes, so a few flakes focused on
+    something else do not tilt it), clipped to +-max_um_h.  0 with fewer than min_n points or a span under min_span_s.
+    The offset is 100x focus - 10x map focus at the same place, so the chip's own tilt and bow are not in it; what is
+    left changing with time is the focus drive and the microscope warming or cooling (20261117_1: +1.9 um/h during the
+    scan, -1.2 um/h over the 4 h after it, then +4 um/h)."""
+    P = np.asarray([p for p in pts if len(p) >= 4 and now - p[3] <= window_s], float).reshape(-1, 4)
+    if len(P) < min_n or np.ptp(P[:, 3]) < min_span_s:
+        return 0.0
+    P = P[-60:]                                       # (the last 60: 1770 pairs)
+    i, j = np.triu_indices(len(P), 1)
+    dt = P[j, 3] - P[i, 3]
+    ok = dt > 30.0                                    # (pairs focused at least 30 s apart)
+    if ok.sum() < min_n:
+        return 0.0
+    r = float(np.median((P[j, 2] - P[i, 2])[ok] / dt[ok]))
+    lim = max_um_h / 3600.0
+    return min(max(r, -lim), lim)
 
 
 def offset_model(pts, max_tilt_um_mm=2.0, max_rms_um=3.0, outlier_um=3.0):
@@ -934,6 +966,14 @@ class Scanner:
             except Exception as e:
                 self.say(f"  (could not set the device timeout: {e})")
         self.z_scale = self.s.z_scale
+        self._box = None
+        if self.s.stage_limits_um is None and hasattr(c, "stageLimitsUm"):
+            # (a core that knows the stage's travel: the Tango's limits, a little inside them)
+            try:
+                self.s.stage_limits_um = list(c.stageLimitsUm(self.s.stage_limit_margin_um))
+                self.say(f"  stage travel (from the controller): {self.box_text()}")
+            except Exception as e:
+                self.say(f"  (the stage's travel was not read: {e})")
         self.FOVX = abs(self.M[0, 0]) * self.W + abs(self.M[0, 1]) * self.H
         self.FOVY = abs(self.M[1, 0]) * self.W + abs(self.M[1, 1]) * self.H
         # focus-drive step size: set it so that Z is in real um; else convert with z_scale
@@ -953,6 +993,25 @@ class Scanner:
                      ("Z in real um" if abs(self.z_scale - 1) < 1e-6 else f"converting in software, z_scale {f3(self.z_scale)} drive units per um")
                      + f"; Z read {f3(zr)}, now {f3(c.getPosition(self.zdev))}")
         self.Z0 = self.z_read() if self.has_z else 0.0
+        self.setup_illumination()
+
+    def setup_illumination(self):
+        """The light set through the nosepiece's control box (setting illumination; hw/cbfm.py), before the first
+        picture.  Without such a box, or with illumination "", nothing."""
+        s = self.s
+        mode = str(getattr(s, "illumination", "") or "").lower()
+        if not mode:
+            return
+        self.open_nosepiece()
+        if self.nose is None or not hasattr(self.nose, "set_illumination"):
+            self.say(f"  WARNING: illumination {mode!r} not set: no control box that can (nosepiece_type cbfm, nosepiece_port)")
+            return
+        try:
+            self.nose.set_illumination(mode, s.illumination_level)
+            time.sleep(0.5)
+            self.say(f"  illumination: {mode}, level {s.illumination_level} (control box: {self.nose.illumination()})")
+        except Exception as e:
+            self.say(f"  WARNING: illumination not set ({e}): check the light by hand")
 
     # (z_shift: how far the focus moved while the scan was paused, e.g. the coarse knob, which the drive does not see:
     # every Z the scan works with stays in its first frame, the drive is sent z + z_shift)
@@ -963,6 +1022,16 @@ class Scanner:
         ref = self.Z0 if isnan(self.zref) else self.zref
         if abs(z - ref) > self.s.max_dz_um:
             return False
+        lim = getattr(self.core, "focusLimitsUm", None)
+        if lim is not None:                          # (the focus drive's safety limits: beyond them, not moved)
+            lo, hi = lim()
+            zd = (z + self.z_shift) * self.z_scale
+            if (lo is not None and zd < lo) or (hi is not None and zd > hi):
+                if not getattr(self, "_zlim_said", False):
+                    self._zlim_said = True
+                    self.say(f"    focus move to Z {f1(z)} um not made: beyond the focus drive's safety limit "
+                             f"({lo} .. {hi}; flakeid.scope.hw.zcal)")
+                return False
         t_op = time.time()
         self.z_write(z)
         self.core.waitForDevice(self.zdev)
@@ -1333,8 +1402,13 @@ class Scanner:
         if self.nose is not None or not s.nosepiece_port:
             return
         try:
-            from .nosepiece import Nosepiece
+            if str(getattr(s, "nosepiece_type", "ucbs")).lower() == "cbfm":
+                from .hw.cbfm import CBFMNosepiece as Nosepiece     # (the BX53M's motorised nosepiece)
+            else:
+                from .nosepiece import Nosepiece
             self.nose = Nosepiece(s.nosepiece_port)
+            if hasattr(self.core, "nosepiece"):          # (the core's focus limit depends on the objective in place)
+                self.core.nosepiece = self.nose
             pos = self.nose.position()
             self.say(f"  nosepiece {self.nose.unit} on {s.nosepiece_port}: position {pos} ({self.objective_name(pos)})")
             if not s.objective_positions:
@@ -1347,6 +1421,8 @@ class Scanner:
         """Free the nosepiece's serial port: the next job (start screen) opens it again, and a port still held by the
         previous job cannot be opened (Windows), which left the objective windows without the position (2026-10-04)."""
         n, self.nose = self.nose, None
+        if getattr(self.core, "nosepiece", None) is not None:
+            self.core.nosepiece = None
         if n is not None:
             try:
                 n.close()
@@ -1575,6 +1651,42 @@ class Scanner:
             return None
         if self.nose.position() == want:
             return True
+        if getattr(self.s, "nosepiece_auto", False) and hasattr(self.nose, "set_position"):
+            # a motorised nosepiece turned by the program (the stage is not lowered first: nosepiece_auto)
+            self.stream_off()
+            try:
+                back = float(getattr(self.s, "nosepiece_retract_um", 0) or 0)
+                if back > 0 and name in ("50x", "100x") and getattr(self, "has_z", False):
+                    z = self.z_read() - back
+                    self.z_write(z); self.core.waitForDevice(self.zdev)
+                    self.say(f"  focus lowered by {f1(back)} um (to Z {f1(z)}) before the nosepiece turns")
+                was = self.objective_name(self.nose.position())
+                self.say(f"  turning the nosepiece to the {name} objective (position {want}) ...")
+                self.nose.set_position(want)
+                time.sleep(0.5)
+                mode = str(getattr(self.s, "illumination", "") or "").lower()
+                if mode and hasattr(self.nose, "set_illumination"):
+                    # (the light again: the control box can come back from a turn with the MIX ring, the darkfield
+                    # light, switched on)
+                    try:
+                        before = self.nose.illumination()
+                        self.nose.set_illumination(mode, self.s.illumination_level)
+                        if str(before.get("MILS")) not in ("0", "None") and mode == "brightfield":
+                            self.say(f"  (the control box had the darkfield ring on after the turn: {before}; switched off)")
+                    except Exception as e:
+                        self.say(f"  WARNING: illumination not set again after the turn ({e})")
+                fo = float(self.s.focus_offset_um)
+                if was == "100x" and name == "10x" and fo == fo and getattr(self, "has_z", False):
+                    # (from the 100x focus to where the 10x objective is in focus: focus_offset_um is 100x - 10x)
+                    z = self.z_read() - fo
+                    self.z_write(z); self.core.waitForDevice(self.zdev)
+                    self.Z0 = z
+                    self.say(f"  focus moved by {f1(-fo)} um to the 10x focus (Z {f1(z)}; focus_offset_um)")
+            except Exception as e:
+                self.say(f"  WARNING: the nosepiece did not turn ({e}); change the objective yourself")
+            if self.nose.position() == want:
+                self.say(f"  objective: position {want} ({name})")
+                return True
         self.say(f"  waiting for the {name} objective (nosepiece position {want}) ...")
         self.alert(f"Put in the {name} objective (nosepiece position {want}).  {msg}")
         ok = self.ui.wait_objective(self, name, want, msg)
@@ -1908,17 +2020,19 @@ class Scanner:
     def frame_level(self):
         fs = self.full_scale()
         bl = self.blocks()
-        sat = ((bl[:, 2] + self.DARK >= fs - 2) | (bl[:, 3] + self.DARK >= fs - 2) | (bl[:, 4] + self.DARK >= fs - 2)).mean()
-        return float(np.median(bl[:, 3]) / (fs - self.DARK)), float(sat)
+        ch = [2 + "rgb".index(c) for c in str(getattr(self.s, "sat_channels", "rgb")).lower() if c in "rgb"] or [2, 3, 4]
+        sat = np.any(bl[:, ch] + self.DARK >= fs - 2, axis=1).mean()
+        lv = bl[:, 2:5].max(axis=1) if str(getattr(self.s, "level_channel", "green")).lower() == "max" else bl[:, 3]
+        return float(np.median(lv) / (fs - self.DARK)), float(sat)
 
     def check_exposure(self, auto):
         s, c = self.s, self.core
         lv = self.frame_level()
         for _ in range(8 if auto else 0):
-            if lv[1] < 0.01 and abs(lv[0] / s.target_level - 1) < 0.15:
+            if lv[1] < s.exposure_sat_ok and abs(lv[0] / s.target_level - 1) < 0.15:
                 break
             ex = c.getExposure()
-            f = 0.1 if (lv[0] > 0.9 or lv[1] > 0.3) else s.target_level / max(lv[0], 0.005)
+            f = 0.1 if (lv[0] > 0.9 or lv[1] > max(0.3, s.exposure_sat_max)) else s.target_level / max(lv[0], 0.005)
             nex = max(s.exposure_range[0], min(s.exposure_range[1], ex * f))
             if abs(nex - ex) < 1e-6:
                 break
@@ -1928,7 +2042,7 @@ class Scanner:
             lv = self.frame_level()
         self.say(f"  frame level: median {f3(lv[0] * 100)} % of full scale ({int(self.full_scale())}), {f3(lv[1] * 100)} % saturated, "
                  f"exposure {f3(c.getExposure())} ms")
-        if lv[1] > 0.05 or lv[0] > 0.85:
+        if lv[1] > s.exposure_sat_max or lv[0] > s.exposure_level_max:
             raise self.fail(f"the image is overexposed (median {f3(lv[0] * 100)} % of full scale, {f3(lv[1] * 100)} % saturated) at exposure "
                             f"{f3(c.getExposure())} ms.  Check the exposure and the lamp, or set auto_exposure.")
         if lv[0] < 0.02:
@@ -1997,6 +2111,33 @@ class Scanner:
             c = cv2.GaussianBlur(c / max(float(c.mean()), 1.0), (0, 0), 1.0)
             gx, gy = cv2.Sobel(c, cv2.CV_32F, 1, 0, ksize=3), cv2.Sobel(c, cv2.CV_32F, 0, 1, ksize=3)
             return float((gx * gx + gy * gy).mean())
+        if str(getattr(self.s, "af_metric", "mean")).lower() == "top":
+            # the strongest 1 % of the gradients.  A raw mosaic: its green sites alone (half the resolution, no mosaic
+            # pattern in it); binned further at 100x, where a pixel is far finer than the optics resolve.  At 10x on the
+            # DP22's raw frames (2026-11-15): green sites unbinned, peak / median 1.43 at the true focus; the mosaic binned
+            # 4x4 gave 1.06 and a peak 5-7 um off (the 10x focus points scattered by 20 um and the tiles were blurred)
+            high = getattr(self, "view_scale", 1.0) < 0.5
+            if a.ndim == 2:
+                # (100x: af100_channel.  The glovebox 100x objective brings red ~1 um higher to focus than green and blue
+                # (2026-11-17, brightfield, 285 nm oxide); the green sites' focus was visibly soft next to Stream's view,
+                # the red sites' matched it: the flakes' and the glue's contrast is mostly in red there)
+                chan = (getattr(self, "_af_chan", None) or str(getattr(self.s, "af100_channel", "green") or "green")).lower() if high else "green"
+                dk = float(getattr(self, "DARK", 0.0) or 0.0)
+                if chan == "red":
+                    q = c[0::2, 0::2] - dk
+                elif chan == "blue":
+                    q = c[1::2, 1::2] - dk
+                else:
+                    q = 0.5 * (c[0::2, 1::2] + c[1::2, 0::2]) - dk
+                k = 2 if high else 1
+            else:
+                q, k = c, (4 if high else 2)
+            if k > 1:
+                q = cv2.resize(q, (max(8, q.shape[1] // k), max(8, q.shape[0] // k)), interpolation=cv2.INTER_AREA)
+            gx, gy = cv2.Sobel(q, cv2.CV_32F, 1, 0, ksize=3), cv2.Sobel(q, cv2.CV_32F, 0, 1, ksize=3)
+            m = np.sqrt(gx * gx + gy * gy).ravel()
+            n = max(8, m.size // 100)
+            return float(np.partition(m, m.size - n)[-n:].mean()) / max(float(q.mean()), 1.0)
         c = c.reshape(rh // 2, 2, rw // 2, 2).mean(axis=(1, 3))              # 2x2 bin removes the colour mosaic
         mean = float(c.mean())
         gx, gy = cv2.Sobel(c, cv2.CV_32F, 1, 0, ksize=3), cv2.Sobel(c, cv2.CV_32F, 0, 1, ksize=3)
@@ -2044,6 +2185,17 @@ class Scanner:
         try:
             self._af_limit = None
             r = self._autofocus(zc, p, fine, t0, s_ext=self.s.af_extend if extend is None else int(extend))
+            if (not r[2] and getattr(self, "view_scale", 1.0) < 0.5 and not getattr(self, "_af_chan", None)
+                    and str(getattr(self.s, "af100_channel", "green") or "green").lower() != "green"):
+                # no focus signal on the af100_channel sites: the same search on green (a flake with little contrast in
+                # red, filling the frame: 20261117_run_3, a 119 nm flake, red peak/median 1.01-1.03 twice)
+                self._af_chan = "green"
+                try:
+                    self.say(f"      no focus signal on {self.s.af100_channel}: the same search on green")
+                    self._af_limit = None
+                    r = self._autofocus(zc, p, fine, t0, s_ext=self.s.af_extend if extend is None else int(extend))
+                finally:
+                    self._af_chan = None
             if limit_check:
                 self.focus_limit_check(float(r[0]) if r[2] else None)
             if r[2]:                                  # (the last focus found with each objective: a pause's reference)
@@ -2554,6 +2706,7 @@ class Scanner:
             elif cached and not isnan(self.z_cmd) and abs(zr - self.z_cmd) > 0.5:
                 self.say(f"    WARNING: the focus drive reads {f3(zr)} um, it was sent to {f3(self.z_cmd)} um")
         self.last_pic = dict(frame=img, x=float(xy[0]), y=float(xy[1]), z=float(zr), hundred=False, what=f"10x tile {label}")
+        self.save_colour(Path(d) / "colour.jpg")
         fm = {"Label": label, "GridCol": int(col), "GridRow": int(row), "XPositionUm": xy[0], "YPositionUm": xy[1],
               "Objective": getattr(self, "tile_objective", ""),
               "ZPositionUm": zr, "ZPositionDrive": zr * self.z_scale if self.has_z else 0,
@@ -2583,6 +2736,27 @@ class Scanner:
         else:
             TileWriter.write(job)
         self.op("file saving (tiles, in the scan thread)", t_op)
+
+    def save_colour(self, path):
+        """The camera's own colour picture of what is in view, beside a raw picture just saved (setting save_colour; a
+        core with colourImage: the glovebox DP22 in raw mode).  .jpg (quality 95) or .tif by the name.  Never stops a run."""
+        fn = getattr(self.core, "colourImage", None)
+        if fn is None or not getattr(self.s, "save_colour", False):
+            return
+        t_op = time.time()
+        try:
+            import cv2
+            rgb = fn(self.objective()[1] or None)
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            if str(path).lower().endswith((".jpg", ".jpeg")):
+                cv2.imwrite(str(path), cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 95])
+            else:                                    # (.png: lossless, opens anywhere)
+                cv2.imwrite(str(path), cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+        except Exception as e:
+            if not getattr(self, "_colour_warned", False):
+                self._colour_warned = True
+                self.say(f"    (colour picture not saved: {type(e).__name__}: {e})")
+        self.op("colour pictures", t_op)
 
     def save_image(self, path, img, info):
         import tifffile
@@ -2684,7 +2858,7 @@ class Scanner:
             self.open_nosepiece()
             if self.wait_objective("domain", "Put in the IR objective (the window closes by itself when it is in).") is False:
                 raise self.fail("cancelled: not on the IR objective")
-            self.view_scale = 1.0 / 9.54
+            self.view_scale = 1.0 / RATIO_100X
             from .domainflat import run_domain_flat
             return run_domain_flat(self)
         if s.mode == "device":                           # (its own objectives, exposures and focus: devicephotos.py)
@@ -2698,6 +2872,12 @@ class Scanner:
             return run_scale_calibration(self)
         hundred = s.mode in ("targets", "capture", "domaintest") or (s.mode == "flat" and s.flat_objective == "100x")
         exposure = s.target_exposure_ms if hundred else s.exposure_ms
+        if getattr(s, "nosepiece_auto", False):
+            # (a nosepiece the program turns: the job's objective first, so that the exposure is set with it in.  A job
+            # started with the 100x in had its 10x exposure set from the 100x picture, 2026-11-15)
+            self.open_nosepiece()
+            if self.wait_objective("100x" if hundred else "10x", "") is False:
+                raise self.fail("cancelled: the objective was not changed")
         if s.set_camera:
             self.apply_camera(exposure)
         self.DARK = s.dark * (self.full_scale() + 1) / 4096.0
@@ -2713,7 +2893,7 @@ class Scanner:
         else:
             if self.wait_objective("100x", "Put in the 100x objective (the window closes by itself when it is in).") is False:
                 raise self.fail("cancelled: not on the 100x objective")
-            self.view_scale = 1.0 / 9.54
+            self.view_scale = 1.0 / RATIO_100X
         self.stage_self_test()
         self.domain_list = []                              # (also for the 100x imaging of the flat / capture / retarget modes)
         self.mosaic_s, self.mosaic_over = {"100x": 0.0, "IR": 0.0}, set()
@@ -2903,7 +3083,17 @@ class Scanner:
         out.mkdir(parents=True, exist_ok=True)
         cmd = [sys.executable, "-m", "flakeid.live", str(self.run_dir), "-o", str(out), "--workers", str(s.analysis_workers),
                "--run", Path(self.manifest).name, "--min-targets", str(s.min_targets)]
-        if type(self.core).__name__ == "MockCore" and str(s.substrate_colour_check).lower() != "on":
+        own = False                 # (another camera's profile with its own substrate anchors: the oxide from the colour)
+        if getattr(s, "profile_raw", ""):
+            try:
+                from flakeid.thickness import load_profile
+                own = bool(load_profile(str(s.profile_raw)).get("substrate_anchors"))
+            except Exception:
+                own = False
+        if type(self.core).__name__ != "MockCore" and own:
+            pass
+        elif (type(self.core).__name__ == "MockCore" and str(s.substrate_colour_check).lower() != "on") \
+                or str(s.substrate_colour_check).lower() == "off":   # (also a camera without a colour calibration)
             # (the simulator's chips are white-balanced pictures: a grey substrate fits no oxide, and the analysis would
             # stop; as the substrate colour check, which is off on the simulator unless set "on")
             cmd += ["--no-refine-oxide"]
@@ -2932,6 +3122,10 @@ class Scanner:
             if s.target_rank != "score":
                 self.say(f"  100x targets of hBN pieces ranked by '{s.target_rank}' (trial: logit(score) + 2 ln(best terrace d)); "
                          "<piece>_targets_alt.csv lists what the score ranking would have chosen instead")
+        if getattr(s, "target_min_score", None) is not None:
+            cmd += ["--min-score", f"{float(s.target_min_score):g}"]
+        if getattr(s, "target_min_d_um", None) is not None:
+            cmd += ["--min-d", f"{float(s.target_min_d_um):g}"]
         if s.flat10:
             cmd += ["--flat", s.flat10]
         for f in s.flat100:
@@ -2951,6 +3145,27 @@ class Scanner:
         self.analysis_out = out
         try:
             env = dict(os.environ, PYTHONUTF8="1")             # text files as UTF-8 (Windows defaults to cp1252)
+            if len(tuple(getattr(s, "hbn_range_nm", ()) or ())) == 2:
+                env["FLAKEID_HBN_RANGE_NM"] = f"{float(s.hbn_range_nm[0]):g},{float(s.hbn_range_nm[1]):g}"
+            if getattr(s, "real100", ""):
+                env["FLAKEID_REAL100"] = str(s.real100)
+                env["FLAKEID_REAL100_CUT"] = f"{float(s.real100_cut):g}"
+                env["FLAKEID_MIN_FLAT"] = f"{float(s.flake_min_flat):g}"
+                env["FLAKEID_MIN_AREA_UM2"] = f"{float(s.flake_min_area_um2):g}"
+                self.say(f"  100x sorting ({s.real100}): real flake with probability >= {float(s.real100_cut):g}, flat share >= "
+                         f"{float(s.flake_min_flat):g}, area >= {float(s.flake_min_area_um2):g} um2")
+            if getattr(s, "profile_raw", ""):
+                env["FLAKEID_PROFILE_RAW"] = str(s.profile_raw)
+                self.say(f"  analysis: camera profile {s.profile_raw}")
+            if float(getattr(s, "residue_ring_solidity", 0) or 0) > 0:
+                env["FLAKEID_RESIDUE_RING_SOLIDITY"] = f"{float(s.residue_ring_solidity):g}"
+            if getattr(s, "faint_flakes", False):
+                env["FLAKEID_FAINT_FLAKES"] = "1"
+                self.say("  analysis: faint flat flakes with a sharp edge are kept (not taken for residue)")
+            if float(getattr(s, "strict_uniformity_um", 0) or 0) > 0:
+                env["FLAKEID_MIN_UNIFORM_D_UM"] = f"{float(s.strict_uniformity_um):g}"
+                self.say(f"  analysis: strict uniformity, regions without a uniform disc of {float(s.strict_uniformity_um):g} um "
+                         "are left out")
             self.analysis = subprocess.Popen(cmd, stdout=open(logp, "a", encoding="utf-8"), stderr=subprocess.STDOUT,
                                              cwd=str(Path(__file__).resolve().parents[2]), env=env)
             self.say(f"  analysis on this PC: {' '.join(cmd[2:])}  (log {logp})")
@@ -3936,7 +4151,7 @@ class Scanner:
                                ("OK", "Cancel")) != 0:
                 raise self.fail("cancelled")
             self.ui.mock_hook(self, "mockObjective", 100)
-        self.view_scale = 1.0 / 9.54
+        self.view_scale = 1.0 / RATIO_100X
         self.stream_off()
         self.core.setExposure(self.s.target_exposure_ms)
 
@@ -4081,7 +4296,7 @@ class Scanner:
         img = self.frame()
         _, Mf = self._frame_grey(img)
         here = np.array([self.core.getXPosition(self.xy), self.core.getYPosition(self.xy)])
-        m = RMM.locate_masked(self._frame_colour(img), np.asarray(Mf, float) / 9.54, pic, pum, R)
+        m = RMM.locate_masked(self._frame_colour(img), np.asarray(Mf, float) / RATIO_100X, pic, pum, R)
         if m is None or m["peak"] < RMM.MASKED_MIN_PEAK or m["second"] > RMM.MASKED_MAX_SECOND * m["peak"]:
             return None
         return here + np.asarray(m["offset"], float), float(m["peak"])
@@ -4214,7 +4429,7 @@ class Scanner:
         def snap():
             img = self.frame()
             grey, Mf = self._frame_grey(img)
-            seen["g"] = (grey, np.asarray(Mf, float) / 9.54, np.array([c.getXPosition(self.xy), c.getYPosition(self.xy)]),
+            seen["g"] = (grey, np.asarray(Mf, float) / RATIO_100X, np.array([c.getXPosition(self.xy), c.getYPosition(self.xy)]),
                          self._frame_colour(img), None)
             return seen["g"]
 
@@ -4282,7 +4497,7 @@ class Scanner:
                 return r, f"here ({way})"
             # a 3 x 3 mosaic of 100x frames around it, stitched by the stage positions into one picture (the flake can
             # be between frames)
-            fw, fh = 0.8 * self.FOVX / 9.54, 0.8 * self.FOVY / 9.54
+            fw, fh = 0.8 * self.FOVX / RATIO_100X, 0.8 * self.FOVY / RATIO_100X
             frames, cframes = [(g0[2], g0[0])], [(g0[2], g0[3])]
             for dx, dy in [(a_, b_) for b_ in (-1, 0, 1) for a_ in (-1, 0, 1)]:
                 if dx == 0 and dy == 0:
@@ -5316,7 +5531,7 @@ class Scanner:
                     self.say("  100x part cancelled")
                     jobs = []
                 else:
-                    self.view_scale = 1.0 / 9.54
+                    self.view_scale = 1.0 / RATIO_100X
             elif scanned and s.objective_prompt:
                 self.alert(f"All pieces are scanned ({len(scanned)} of {len(self.pieces)}): switch to the 100x objective (without changing "
                            "the focus) and press OK in the scan program.")
@@ -5329,7 +5544,7 @@ class Scanner:
                     jobs = []
                 else:
                     self.ui.mock_hook(self, "mockObjective", 100)
-                    self.view_scale = 1.0 / 9.54            # live view stage jog: 100x pixels
+                    self.view_scale = 1.0 / RATIO_100X            # live view stage jog: 100x pixels
             if jobs:
                 self.write_manifest(self.manifest, self.pieces, "imaging")
                 self.stream_off()
@@ -5478,6 +5693,11 @@ class Scanner:
                     self.say(f"  focus offset 100x - 10x: median {f3(med)} um ({len(offs)} flakes, range {f3(ov[0])} .. {f3(ov[-1])}); "
                              f"latest {f3(float(np.median(self.recent_offs[-3:])))} um (the next piece starts from it)")
                 s.focus_offset_um = med
+                tt = [o for o in offs if len(o) >= 4]
+                if len(tt) >= 8 and tt[-1][3] - tt[0][3] >= 600:
+                    r = drift_rate(tt, tt[-1][3], window_s=1e9, max_um_h=1e9) * 3600.0
+                    self.say(f"  focus drift during the 100x imaging: {r:+.1f} um/h over {(tt[-1][3] - tt[0][3]) / 60:.0f} min"
+                             + (" (followed: focus_drift_half_life_min)" if getattr(s, "focus_drift_half_life_min", 0) else ""))
                 po = fit_plane(offs)
                 if po is not None and len(offs) >= 4 and not P["jumps"]:
                     self.say(f"  offset varies by {f3(po[0] * 1000)} um/mm in X, {f3(po[1] * 1000)} um/mm in Y across the piece (10x map tilt error)")
@@ -5528,7 +5748,7 @@ class Scanner:
             m = re.search(r"F0*(\d+)", lab)
             self.coord_refs[(self.s.name, Path(fn).stem)] = dict(
                 piece=self.s.name, label=lab, stem=Path(fn).stem, flake_id=int(m.group(1)) if m else len(self.coord_refs) + 1,
-                x=float(x), y=float(y), z=float(z), focus=how, picture=str(f), um_px=float(np.sqrt(abs(np.linalg.det(np.asarray(Mf, float))))) / 9.54,
+                x=float(x), y=float(y), z=float(z), focus=how, picture=str(f), um_px=float(np.sqrt(abs(np.linalg.det(np.asarray(Mf, float))))) / RATIO_100X,
                 frame_wh=[g8.shape[1], g8.shape[0]], t=time.time())
         except Exception as e:
             self.say(f"    (not kept for the coordinate check: {type(e).__name__}: {e})")
@@ -6023,10 +6243,19 @@ class Scanner:
         there is one, corrected by the flakes focused since (a distance-weighted mean of their differences from it);
         else the distance-weighted mean of the flakes focused so far, or the start offset."""
         m = P.get("off_model")
+        pts = P["seg_offs"]
         if m is not None:
-            res = [(px, py, o - m(px, py)) for px, py, o in P["seg_offs"]]
-            return m(x, y) + (idw_offset(x, y, res) if res else 0.0)
-        return idw_offset(x, y, P["seg_offs"]) if P["seg_offs"] else P["off0"]
+            pts = [(p[0], p[1], p[2] - m(p[0], p[1])) + tuple(p[3:]) for p in pts]
+        if not pts:
+            return m(x, y) if m is not None else P["off0"]
+        # the focus drifts with time (focus_drift_half_life_min): the offsets brought forward by the drift rate of the
+        # last focus_drift_window_min, the latest flakes weighted most
+        hl = float(getattr(self.s, "focus_drift_half_life_min", 0.0) or 0.0) * 60.0
+        now = time.time()
+        rate = drift_rate(pts, now, window_s=float(getattr(self.s, "focus_drift_window_min", 60.0)) * 60.0) if hl > 0 else 0.0
+        P["drift_um_h"] = rate * 3600.0
+        o = idw_offset(x, y, pts, now=now if hl > 0 else None, half_life_s=hl, rate=rate)
+        return (m(x, y) + o) if m is not None else o
 
     def manual_focus_points(self, P, batch):
         """avram new1: at the start of a piece's 100x imaging, int(its 10x focus points / hundred_manual_focus_divisor) of its targets (`batch`, the
@@ -6091,8 +6320,8 @@ class Scanner:
             msg = f"    manual focus point {j + 1}: {lab} at {f1(x)}, {f1(y)} um, Z {f3(zz)}"
             if not isnan(z10):
                 off = zz - z10
-                P["offs"].append((x, y, off))
-                P["seg_offs"].append((x, y, off))
+                P["offs"].append((x, y, off, time.time()))         # (the time: predicted_offset follows the drift)
+                P["seg_offs"].append(P["offs"][-1])
                 self.recent_offs.append(off)
                 manual.append((x, y, off))
                 msg += f", offset (100x - 10x) {f3(off)} um"
@@ -6255,9 +6484,9 @@ class Scanner:
         pts = np.array(list(flk.values()), float).reshape(-1, 2)
         # the 10x -> 100x objective offset in the target list (its positions are for the 100x objective)
         d = [(float(t["stage_x_um"]) - flk[t["flake_id"]][0], float(t["stage_y_um"]) - flk[t["flake_id"]][1]) for t in T if t.get("flake_id") in flk]
-        off = np.median(np.array(d), axis=0) if d else np.array([24.0, -18.3])
+        off = np.median(np.array(d), axis=0) if d else np.array(OFFSET_100X)
         if not d or np.hypot(*off) > 300:
-            off = np.array([24.0, -18.3])
+            off = np.array(OFFSET_100X)
         if not len(pts):                                  # (no flake list: the targets stand in for the flakes)
             pts = np.array([[float(t["stage_x_um"]), float(t["stage_y_um"])] for t in T], float) - off
         self.say(f"  {len(pts)} flakes of 150 um^2 or more to match; target offset {f1(off[0])}, {f1(off[1])} um")
@@ -6462,7 +6691,7 @@ class Scanner:
             if self.ui.confirm("Re-image: 100x", "Switch to the 100x objective now, without changing the focus.\nPress OK when it is in.", ("OK", "Cancel")) != 0:
                 raise self.fail("cancelled")
             self.ui.mock_hook(self, "mockObjective", 100)
-        self.view_scale = 1.0 / 9.54
+        self.view_scale = 1.0 / RATIO_100X
         self.stream_off()
         c.setExposure(s.target_exposure_ms)
         self.crops_dir = root / f"{piece}_targets_crops"
@@ -6951,7 +7180,7 @@ class Scanner:
         if bgr is None:
             return None
         h, w = bgr.shape[:2]
-        fw, fh = self.W / 9.54, self.H / 9.54                       # the 100x field in 10x pixels (same camera)
+        fw, fh = self.W / RATIO_100X, self.H / RATIO_100X                       # the 100x field in 10x pixels (same camera)
         marks = np.zeros((h, w), np.uint8)
         cv2.rectangle(marks, (int(w / 2 - fw / 2), int(h / 2 - fh / 2)), (int(w / 2 + fw / 2), int(h / 2 + fh / 2)), 1, 6)
         cv2.drawMarker(marks, (w // 2, h // 2), 1, cv2.MARKER_CROSS, 18, 5)
@@ -6965,9 +7194,9 @@ class Scanner:
         from .ui import bayer_half
         img = self.frame()
         if img.ndim == 2:
-            rgb, kk = bayer_half(img) - self.DARK, 2.0 / 9.54
+            rgb, kk = bayer_half(img) - self.DARK, 2.0 / RATIO_100X
         else:
-            rgb, kk = img[..., :3].astype(np.float32), 1.0 / 9.54
+            rgb, kk = img[..., :3].astype(np.float32), 1.0 / RATIO_100X
         small = cv2.resize(np.ascontiguousarray(rgb), None, fx=kk, fy=kk, interpolation=cv2.INTER_AREA)
         m = RT.match_crop(RT.grey(small), crop, um_px=float(np.sqrt(abs(np.linalg.det(np.asarray(self.M, float))))))
         # colours for the bare-substrate test: the frame's commonest colour (and how much of it) and the centre's
@@ -7007,7 +7236,7 @@ class Scanner:
         ref = np.median(np.array(self.sub100), axis=0) if len(self.sub100) >= 3 else (col["mode"] if col["frac"] >= 0.7 else None)
         centre_bare = ref is not None and float(np.abs(col["centre"] / np.maximum(ref, 1e-6) - 1.0).max()) < 0.03
         if not good(m) and s.recentre_search and centre_bare:
-            fw, fh = self.FOVX / 9.54, self.FOVY / 9.54                  # the 100x field (um)
+            fw, fh = self.FOVX / RATIO_100X, self.FOVY / RATIO_100X                  # the 100x field (um)
             best = None
             for a in range(0, 360, 60):
                 p = cur + 0.8 * np.array([fw * math.cos(math.radians(a)), fh * math.sin(math.radians(a))])
@@ -7051,7 +7280,7 @@ class Scanner:
         s, c = self.s, self.core
         img = self.frame()
         rgb = bayer_half(img) - self.DARK if img.ndim == 2 else img[..., :3].astype(np.float32)
-        kk = 2.0 / 9.54
+        kk = 2.0 / RATIO_100X
         small = cv2.resize(np.ascontiguousarray(rgb), None, fx=kk, fy=kk, interpolation=cv2.INTER_AREA)
         h, w = small.shape[:2]
         cur = np.array([c.getXPosition(self.xy), c.getYPosition(self.xy)])
@@ -7089,7 +7318,7 @@ class Scanner:
             fr = self.autofocus(zg, s.af100_first)
             img = self.frame()
             rgb = bayer_half(img) - self.DARK if img.ndim == 2 else img[..., :3].astype(np.float32)
-            kk = 2.0 / 9.54                                         # half-resolution 100x pixels -> 10x pixels (same camera)
+            kk = 2.0 / RATIO_100X                                         # half-resolution 100x pixels -> 10x pixels (same camera)
             small = cv2.resize(np.ascontiguousarray(rgb), None, fx=kk, fy=kk, interpolation=cv2.INTER_AREA)
             h, w = small.shape[:2]
             g = np.array([c.getXPosition(self.xy), c.getYPosition(self.xy)]) - off       # as a 10x stage position
@@ -7365,7 +7594,8 @@ class Scanner:
         zg = z10 + off_known if not isnan(z10) and not isnan(off_known) else self.predict_z(x, y, P["seg_focused"], chip_tilt, self.z_read())
         if s.verbose:
             self.say(f"    start Z {f3(zg)}" + (f" (10x focus {f3(z10)}" + (", offset not known yet)" if isnan(off_known) else f" + offset {f3(off_known)})")
-                                                if not isnan(z10) else ""))
+                                                if not isnan(z10) else "")
+                     + (f", focus drift {P['drift_um_h']:+.1f} um/h" if P.get("drift_um_h") else ""))
         known = bool(P["seg_focused"]) or (not isnan(z10) and not isnan(off_known))
         self.zref = zg if known else NAN
         how, ratio, rej, jump = "", 0.0, NAN, NAN
@@ -7521,8 +7751,8 @@ class Scanner:
             P["n_ok"] += 1
             if not isnan(z10):
                 off = zz - z10
-                P["offs"].append((x, y, off))
-                P["seg_offs"].append((x, y, off))
+                P["offs"].append((x, y, off, time.time()))         # (the time: predicted_offset follows the drift)
+                P["seg_offs"].append(P["offs"][-1])
                 self.recent_offs.append(off)
                 if recentred not in ("", "unsure", "not found"):          # (the flake recognised: an offset to trust)
                     P.setdefault("good_offs", []).append(off)
@@ -7552,6 +7782,7 @@ class Scanner:
                 "format": c.getProperty(cam, "Data format") if c.hasProperty(cam, "Data format") else "", "frames": nfr,
                 "bit_depth": fs, "bayer": "RGGB (R at top-left)"}
         self.save_image(img_dir / fn, im, info)
+        self.save_colour(img_dir / fn.replace(".tif", "_colour.png"))
         # the pause check's reference: the last focused picture; a predicted one (no autofocus at each flake) when there is
         # no focused 100x picture yet (2026-10-27: a pause at 100x had none, a coarse-knob change went unseen)
         lp = self.last_pic
@@ -7657,7 +7888,7 @@ class Scanner:
             return
         if self.mosaic_budget("100x") <= 0:
             return
-        M100 = np.asarray(self.M, float) / 9.54
+        M100 = np.asarray(self.M, float) / RATIO_100X
         sx0, sy0, z0 = main_xyz
         fields = self.plan_mosaic(t.poly, M100, (self.W, self.H), lab, "100x")
         if not fields:
@@ -7734,7 +7965,7 @@ class Scanner:
             return
         if how not in ("auto", "manual") or self.mosaic_budget("IR") <= 0:
             return
-        MD = np.asarray(s.domain_px_um_matrix, float).reshape(2, 2) if s.domain_px_um_matrix else np.asarray(self.M, float) / 9.54 / 0.358
+        MD = np.asarray(s.domain_px_um_matrix, float).reshape(2, 2) if s.domain_px_um_matrix else np.asarray(self.M, float) / RATIO_100X / 0.358
         sx0, sy0, z0 = main_xyz
         fields = self.plan_mosaic(e["poly"], MD, (self.W, self.H), lab, "IR")
         if not fields:
@@ -8049,7 +8280,7 @@ class Scanner:
             self.X0, self.Y0 = c.getXPosition(self.xy), c.getYPosition(self.xy)
             if self.has_z:
                 self.zref = self.z_read()
-        fs_ = 1.0 / 9.54 if s.flat_objective == "100x" else 1.0
+        fs_ = 1.0 / RATIO_100X if s.flat_objective == "100x" else 1.0
         # positions only need to differ by more than the dust / particles to be removed: 0.6 of a field from the start
         # screen (25 frames fit in ~4 mm at 10x), a full field from the command line as before
         step = s.flat_step_um if s.flat_step_um > 0 else (0.6 if gui else 1.1) * max(self.FOVX * fs_, self.FOVY * fs_)

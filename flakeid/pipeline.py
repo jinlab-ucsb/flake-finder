@@ -18,6 +18,7 @@ from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
 import cv2
+import os as _os
 import numpy as np
 
 from . import __version__
@@ -35,6 +36,11 @@ from .thickness import (ThicknessEstimator, OxideError, describe_substrate_oxide
 
 # Default thickness window of interest (nm) per material
 DEFAULT_RANGE_NM = {"graphite": (0.3, 25.0), "hbn": (0.0, 100.0)}
+try:        # (environment FLAKEID_HBN_RANGE_NM "min,max", the scan setting hbn_range_nm: another window for hBN)
+    if _os.environ.get("FLAKEID_HBN_RANGE_NM"):
+        DEFAULT_RANGE_NM["hbn"] = tuple(float(v) for v in _os.environ["FLAKEID_HBN_RANGE_NM"].split(","))[:2]
+except ValueError:
+    pass
 
 # flags from the thin-film model's fit, which rhombohedral screening does not use (its layer number comes from the
 # measured colour path, flakeid.rhombo); enclosed_in_thick: thin graphite next to thicker thin graphite is not a facet
@@ -69,6 +75,31 @@ THIN_SEARCH_MAX_NM = 5.0           # is found is haze, not flakes)
 THIN_SEARCH_STEP = 0.7             # a flake's edge: the channel just outside (1.5 - 4 px) falls by >= 70 % of its inside
                                    # (a haze patch fades into more haze: the strongest test on run_13, 17084 -> 532 regions)
 
+
+
+try:
+    STRICT_UNIFORM_D_UM = float(_os.environ.get("FLAKEID_MIN_UNIFORM_D_UM", "0") or 0)
+except ValueError:
+    STRICT_UNIFORM_D_UM = 0.0
+# A faint region in a field of similar haze is still a flake if it is compact itself (environment
+# FLAKEID_RESIDUE_RING_SOLIDITY, the scan setting residue_ring_solidity; 0 = off).  Glovebox BX53M, 2026-11-16: a clean
+# 12 nm hBN flake beside tape glue (raw_3 100x picture 21) was left out as residue for its surroundings alone (ring
+# 0.18); of the 110 regions of that chip left out only as residue, the 7 with solidity >= 0.85 and sharp edges held that
+# flake and no labelled glue, the other 103 held 15 labelled glue pictures and no flake (glue: solidity 0.3-0.77)
+try:
+    RESIDUE_RING_SOLIDITY = float(_os.environ.get("FLAKEID_RESIDUE_RING_SOLIDITY", "0") or 0)
+except ValueError:
+    RESIDUE_RING_SOLIDITY = 0.0
+# Faint flat flakes (environment FLAKEID_FAINT_FLAKES=1, the scan setting faint_flakes; glovebox BX53M, 2026-11-17): a
+# transparent-material region left out only as low_contrast and/or residue_like is kept, flagged "faint_flake", when it
+# is clearly a film and not glue: the colour of FAINT_MIN_NM or more of the material (fit residual <= FAINT_MAX_RESIDUAL),
+# flat at full resolution (fill >= FAINT_MIN_FILL), a sharp edge (<= FAINT_MAX_EDGE_UM) and no similar haze around it
+# (ring_similar <= FAINT_MAX_RING).  20261117_1: a flat 2 nm hBN flake 25 um across (photographed on another microscope)
+# was left out as low_contrast + residue_like; of the 562 regions this camera's analysis leaves out that way, the rule
+# keeps 7 (6 um or wider), that flake among them.
+FAINT_FLAKES = _os.environ.get("FLAKEID_FAINT_FLAKES", "") not in ("", "0")
+FAINT_SOFT = {"low_contrast", "residue_like"}
+FAINT_MIN_NM, FAINT_MAX_RESIDUAL, FAINT_MIN_FILL, FAINT_MAX_EDGE_UM, FAINT_MAX_RING = 1.5, 0.05, 0.95, 2.5, 0.2
 
 def _thin_step(r, cs, labels, w):
     """How much the thin-hBN channel (weights w) falls at a region's edge: 1 - (median just outside) / (median inside);
@@ -490,6 +521,8 @@ def find_flakes(image, material: str, oxide_nm: float, *,
     if profile is None and img.metadata.get("source") == "micromanager" \
             and img.metadata.get("data_format", "").upper().startswith("RAW"):
         profile = "bx51_xc10_mm_raw16"          # linear raw sensor data (Stream profiles include its processing)
+        if _os.environ.get("FLAKEID_PROFILE_RAW"):  # (another camera's raw data: its own profile, the scan setting
+            profile = _os.environ["FLAKEID_PROFILE_RAW"]    # profile_raw; one profile for every material there)
         if material == "graphite":              # (its own fit: the hBN-calibrated one put 2-12 nm graphite at 8-11 nm)
             profile = "bx51_xc10_mm_raw16_graphite"
             log("graphite: profile fitted on graphite_20261019_run_1 (1-4 layer anchors + the run's colours); above "
@@ -632,9 +665,11 @@ def find_flakes(image, material: str, oxide_nm: float, *,
     residue = set()
     if not absorbing:
         for r in regions:
-            if float(np.linalg.norm(r.median)) < haze_contrast and (
-                    r.ring_similar > residue_ring_similar or _solidity(r.mask) < residue_solidity
-                    or r.edge_width * px_um > residue_edge_um):
+            if float(np.linalg.norm(r.median)) >= haze_contrast:
+                continue
+            sol, wide = _solidity(r.mask), r.edge_width * px_um > residue_edge_um
+            ring = r.ring_similar > residue_ring_similar and not (0 < RESIDUE_RING_SOLIDITY <= sol)
+            if ring or sol < residue_solidity or wide:
                 residue.add(r.label)
 
     def in_window(r, fit):
@@ -850,7 +885,14 @@ def find_flakes(image, material: str, oxide_nm: float, *,
         # as often worth imaging as the rest -> only a soft flag (scored)
         if float(np.linalg.norm(r.median)) >= 0.4:
             hard = hard - {"poor_colour_match"}
-        if not include_rejected and hard & set(flags):
+        if STRICT_UNIFORM_D_UM > 0:
+            hard = hard - {"residue_like"}      # (strict uniformity, below: the width of the uniform area decides)
+        # faint flat flake (FAINT_FLAKES): only the faint-residue rules reject it, and its colour, edge and surroundings
+        # are a film's; flatness is checked below, at full resolution
+        faint_try = (FAINT_FLAKES and not absorbing and not rhombo and bool(hard & set(flags)) and hard & set(flags) <= FAINT_SOFT
+                     and fit.thickness_nm >= FAINT_MIN_NM and fit.residual <= FAINT_MAX_RESIDUAL
+                     and r.edge_width * px_um <= FAINT_MAX_EDGE_UM and r.ring_similar <= FAINT_MAX_RING)
+        if not include_rejected and hard & set(flags) and not faint_try:
             continue
 
         # geometry
@@ -882,7 +924,21 @@ def find_flakes(image, material: str, oxide_nm: float, *,
             flags.append("in_haze")
         if cmag < low_confidence_contrast:
             flags.append("low_confidence")      # faint: identification less certain
-        if not include_rejected and not rhombo and {"not_flat", "in_haze"} & set(flags):     # irregular_shape: soft (labels)
+        if faint_try:
+            if fill >= FAINT_MIN_FILL and "in_haze" not in flags:
+                flags = [f for f in flags if f not in FAINT_SOFT] + ["faint_flake"]
+            elif not include_rejected:
+                continue
+        strict = STRICT_UNIFORM_D_UM > 0 and not rhombo
+        if not include_rejected and not rhombo and ({"in_haze"} if strict else {"not_flat", "in_haze"}) & set(flags):
+            continue                                                                         # irregular_shape: soft (labels)
+        # strict uniformity (environment FLAKEID_MIN_UNIFORM_D_UM, the scan setting strict_uniformity_um; glovebox BX53M,
+        # 2026-11-13): tape glue has the colour of thin hBN in that camera's picture and only its shape tells it apart:
+        # patchy, no uniform area wider than 5-7 um (12.6 um in one large patch; the good flakes there: 27-36 um).  A
+        # region must hold a uniform disc of this diameter, else it is left out.  The rules not_flat, residue_like and
+        # irregular_shape do not reject there: their tolerances are for the XC10's raw data, and on the DP22's 8-bit
+        # picture they dropped a flat, faint 36 um flake (the thin flakes wanted)
+        if not include_rejected and strict and inscribed < STRICT_UNIFORM_D_UM:
             continue
         if w_ < h_:
             w_, h_, ang = h_, w_, ang + 90.0

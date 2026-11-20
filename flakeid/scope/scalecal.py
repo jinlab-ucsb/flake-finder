@@ -15,6 +15,8 @@ window's picture tools); without it the stage calibration M (10x) and the magnif
 """
 from __future__ import annotations
 
+from flakeid.hwconst import OFFSET_100X, RATIO_100X  # noqa: F401  (the microscope's 100x ratio and offset)
+
 import json
 import time
 from pathlib import Path
@@ -55,7 +57,7 @@ def nominal_um_per_px(sc, name):
         mag = float(str(name).lower().rstrip("x"))
     except ValueError:
         return float("nan")
-    k = 1.0 / 9.54 if abs(mag - 100) < 1e-6 else 10.0 / mag
+    k = 1.0 / RATIO_100X if abs(mag - 100) < 1e-6 else 10.0 / mag
     return float(np.sqrt(abs(np.linalg.det(np.asarray(sc.M, float))))) * k
 
 

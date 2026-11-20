@@ -56,6 +56,7 @@ def camera_from_profile(profile: dict) -> CameraModel:
         gamma=c.get("gamma", 2.2),
         ccm=tuple(map(tuple, c["ccm"])) if c.get("ccm") is not None else None,
         flare=tuple(c.get("flare", (0.0, 0.0, 0.0))),
+        led=tuple(c["led"]) if c.get("led") else None,
     )
 
 
@@ -130,7 +131,7 @@ class ThicknessEstimator:
         dist, idx = self._tree.query(flat)
         return self.d[idx].reshape(contrast.shape[:-1]), dist.reshape(contrast.shape[:-1])
 
-    def fit(self, c: np.ndarray, tol: float = 0.05, censored=None, prefer_thin: float = 0.02) -> ThicknessFit:
+    def fit(self, c: np.ndarray, tol: float = 0.05, censored=None, prefer_thin: float | None = None) -> ThicknessFit:
         """Thickness of one (median) contrast vector with uncertainty.
 
         tol:      contrast-space tolerance used to define the acceptable range
@@ -145,6 +146,15 @@ class ThicknessEstimator:
         dist = np.linalg.norm(diff, axis=1)
         best = float(dist.min())
         ok = dist <= np.hypot(best, tol)
+        # prefer_thin from the profile ("prefer_thin"): a camera whose model is only good to that much.  Glovebox DP22,
+        # 2026-11-16: ~30 and ~316 nm hBN have the same colour within the fit's error (0.05), ten flakes read 30 and two
+        # of the same look read 316 for a residual 0.02-0.05 smaller; the thin branch then also counts when it is
+        # outside tol, and the other is listed as an alternative
+        wide = prefer_thin is None and self.profile.get("prefer_thin") is not None
+        if prefer_thin is None:
+            prefer_thin = float(self.profile.get("prefer_thin", 0.02))
+        if wide:
+            ok = ok | (dist <= best + prefer_thin)
         # contiguous branches of acceptable thickness, each with its best point
         lab, n = ndimage.label(ok)
         branches = []
@@ -157,6 +167,13 @@ class ThicknessEstimator:
         # exfoliated flakes; the others are reported as alternatives
         good = [b for b in branches if dist[b[2]] <= best + prefer_thin]
         s0, e0, i = min(good, key=lambda b: self.d[b[2]])
+        if wide:                # (the range: within tol of the chosen branch's own best point)
+            near = dist <= np.hypot(float(dist[i]), tol)
+            s0 = e0 = i
+            while s0 > 0 and near[s0 - 1]:
+                s0 -= 1
+            while e0 < len(near) - 1 and near[e0 + 1]:
+                e0 += 1
         rng = (float(self.d[s0]), float(self.d[e0]))
         alts = [round(float(self.d[j]), 1) for s_, e_, j in branches if j != i]
         best = float(dist[i])
@@ -221,6 +238,29 @@ class OxideError(RuntimeError):
     """The substrate's colour gives no oxide close to the entered one (stop: the thicknesses would be wrong)."""
 
 
+def _profile_anchors():
+    """(anchors, substrate level function of the oxide) of the raw profile of another camera (FLAKEID_PROFILE_RAW, the
+    scan setting profile_raw) if it carries "substrate_anchors"; else None: the XC10's SUBSTRATE_ANCHORS."""
+    import os
+    name = os.environ.get("FLAKEID_PROFILE_RAW")
+    if not name:
+        return None
+    try:
+        prof = load_profile(name)
+    except OSError:
+        return None
+    if not prof.get("substrate_anchors"):
+        return None
+    from .optics import ContrastModel
+    cam, na, cache = camera_from_profile(prof), float(prof.get("na", 0.30)), {}
+
+    def level(ox):
+        if ox not in cache:
+            cache[ox] = ContrastModel("hbn", ox, na=na, camera=cam).substrate_reflectance()
+        return cache[ox]
+    return tuple((float(a[0]), float(a[1]), tuple(a[2])) for a in prof["substrate_anchors"]), level
+
+
 def oxide_from_substrate(rgb, entered_nm: float, search_rel: float = 0.25) -> dict | None:
     """The oxide that explains a substrate level rgb (any units: only R/G and B/G count), searched within search_rel of
     the entered (nominal) oxide, as dict(nm: nominal scale, model_nm: thin-film model, misfit, rg, bg, anchor_nm, ok:
@@ -231,7 +271,11 @@ def oxide_from_substrate(rgb, entered_nm: float, search_rel: float = 0.25) -> di
     entered = float(entered_nm)
     if rgb.shape != (3,) or not np.all(rgb > 0) or entered <= 0:
         return None
-    nom, mod, ratios = min(SUBSTRATE_ANCHORS, key=lambda a: abs(np.log(a[0] / entered)))
+    own = _profile_anchors()
+    anchors = SUBSTRATE_ANCHORS
+    if own:
+        anchors, _substrate_rgb = own
+    nom, mod, ratios = min(anchors, key=lambda a: abs(np.log(a[0] / entered)))
     if abs(entered / nom - 1) > 0.5:
         return None
     rg, bg = rgb[0] / rgb[1], rgb[2] / rgb[1]

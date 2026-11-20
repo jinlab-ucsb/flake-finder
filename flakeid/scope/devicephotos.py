@@ -35,6 +35,8 @@ read then is remembered in the settings file.
 """
 from __future__ import annotations
 
+from flakeid.hwconst import OFFSET_100X, RATIO_100X  # noqa: F401  (the microscope's 100x ratio and offset)
+
 import datetime
 import json
 import re
@@ -117,7 +119,7 @@ def shoot(sc, D, obj, label):
         sc.say(f"  {obj}: {r}")
         return "stop" if r == "stop" else None
     sc.objective_now = obj
-    sc.view_scale = 1.0 / 9.54 if obj == "100x" else 10.0 / MAG[obj]
+    sc.view_scale = 1.0 / RATIO_100X if obj == "100x" else 10.0 / MAG[obj]
     _follow_offsets(sc, D, obj)
     D["last_obj"] = obj
     sc.stream_off()

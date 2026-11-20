@@ -1,0 +1,86 @@
+{
+ "camera": {
+  "lamp_temp_k": 3100.0,
+  "centers_nm": [
+   628.4073776481397,
+   528.2716362902845,
+   452.60115329704604
+  ],
+  "fwhm_nm": [
+   60.251203723221934,
+   91.95345520125652,
+   84.31614172733205
+  ],
+  "ir_cut_nm": 652.4803429878984,
+  "gamma": 1.0,
+  "ccm": [
+   [
+    1.0,
+    0.0,
+    0.0
+   ],
+   [
+    0.0,
+    1.0,
+    0.0
+   ],
+   [
+    0.0,
+    0.0,
+    1.0
+   ]
+  ],
+  "flare": [
+   0.09968769729082587,
+   0.06332971411085059,
+   0.08453104323127945
+  ],
+  "led": [
+   450.0,
+   22.0,
+   606.9825728998604,
+   125.93944833686237,
+   6.8597767858974175
+  ]
+ },
+ "na": 0.25,
+ "notes": "Glovebox BX53M + DP22 raw mosaic, MPLN 10x, white LED, flat flats/flat_10x_dp22_raw.npz.  Unsupervised fit (tools/bx53m/fit_colour_profile.py --bounds xc10) to the hBN colours of run raw_3 (one chip, 2026-11-16).  NOT checked against AFM.  A second fit with wide channel ranges gives the same thicknesses (all samples within 5 nm); the empty chip's substrate colour fits as 285.5 nm (misfit 0.0008).",
+ "materials": {},
+ "calibration": {
+  "fitted_oxide_nm": 295.2812777274649,
+  "loss": 0.003111857035086359,
+  "params": {
+   "f_r": 0.0997,
+   "f_g": 0.0633,
+   "f_b": 0.0845,
+   "led_ratio": 6.8598,
+   "led_pc": 606.9826,
+   "led_pw": 125.9394,
+   "c_r": 628.4074,
+   "c_g": 528.2716,
+   "c_b": 452.6012,
+   "w_r": 60.2512,
+   "w_g": 91.9535,
+   "w_b": 84.3161,
+   "ir_cut": 652.4803,
+   "gr_n550": 2.7233,
+   "gr_k550": 1.5236,
+   "gr_kslope": 0.1476,
+   "oxide_0": 1.0361
+  },
+  "tiles": [
+   "C:/FlakeScans/raw_3_tiles"
+  ]
+ },
+ "substrate_anchors": [
+  [
+   295.3,
+   295.3,
+   [
+    0.3055,
+    2.6522
+   ]
+  ]
+ ],
+ "prefer_thin": 0.06
+}

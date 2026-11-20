@@ -16,6 +16,8 @@ are deleted once every JPEG / PNG is written, unless --keep-tiles.
 """
 from __future__ import annotations
 
+from flakeid.hwconst import OFFSET_100X, RATIO_100X  # noqa: F401  (the microscope's 100x ratio and offset)
+
 import argparse
 import csv
 import json
@@ -34,10 +36,10 @@ WHITE = 510.0                     # display value shown as white (2 x the demo s
 # substrate, and the extra levels keep its faint contrast from being flattened into 8 x 8 blocks by the JPEG
 # (2026-10-04); thick graphite (~2x the substrate on 90 nm oxide) still stays below white
 WHITE_BY_MATERIAL = {"hbn": 510.0, "graphite": 380.0}
-OFFSET_100X = (24.0, -18.3)       # 10x -> 100x stage offset (flakeid.live --offset default)
+# (OFFSET_100X: flakeid.hwconst)       # 10x -> 100x stage offset (flakeid.live --offset default)
 LABEL_MATCH_UM = 250.0            # a 100x picture goes to the flake its label names when within this of it (attach)
 SAME_TARGET_UM = 20.0             # ... unless another flake's 10x position is within this of the picture's planned one
-RATIO_100X = 9.54                 # 100x pixels per 10x pixel (BX51 + XC10)
+# (RATIO_100X: flakeid.hwconst)                 # 100x pixels per 10x pixel (BX51 + XC10)
 # debris on the terrace of interest
 TERRACE_TOL = 0.04                # terrace: within 4 % of the centre colour (flattened, 1 px smoothed)
 DEBRIS_DEV = 0.025                # debris: colour distance from the terrace above 2.5 % ...
@@ -520,6 +522,12 @@ def _init_ctx(ctx):
 
 def _linear(raw):
     from .mm import BAYER_CODE
+    if raw.ndim == 3:
+        # (a camera that delivers a finished 8-bit colour picture, the glovebox DP22: no mosaic, no dark level; scaled
+        # to the 12-bit range the rest of the export works in)
+        rgb = cv2.cvtColor(raw[..., :3], cv2.COLOR_BGR2RGB).astype(np.float32) * (4095.0 / 255.0)
+        FF = _CTX.get("FF")
+        return FF.apply(rgb) if FF is not None else rgb
     rgb = cv2.cvtColor(raw, BAYER_CODE).astype(np.float32)
     FF = _CTX.get("FF")
     return FF.apply(rgb) if FF is not None else rgb - _CTX["dark"]
@@ -781,12 +789,21 @@ def _write_one(r):
         shift_used=bool(resid) and all(q[2] >= SHIFT_MIN_SCORE for q in resid),
         thresholds=dict(terrace_tol=TERRACE_TOL, debris_dev=DEBRIS_DEV, debris_dog=DEBRIS_DOG,
                         debris_min_px=DEBRIS_MIN_PX, step_min_um2=STEP_MIN_UM2, edge_exclude_um=EDGE_EXCLUDE_UM,
-                        clean_margin_um=CLEAN_MARGIN_UM)), separators=(",", ":")))
+                        clean_margin_um=CLEAN_MARGIN_UM)), separators=(",", ":"), default=_json_plain))
     cv2.imwrite(str(out / "preview" / f"{stem}.jpg"), cv2.resize(bgr, (480, int(480 * bgr.shape[0] / bgr.shape[1])),
                                                                 interpolation=cv2.INTER_AREA), jpeg_params(min(quality, DIAG_QUALITY)))
     cv2.imwrite(str(out / "preview" / f"{stem}_look.jpg"), cv2.resize(lk, (480, int(480 * lk.shape[0] / lk.shape[1])),
                                                                       interpolation=cv2.INTER_AREA), jpeg_params(min(quality, DIAG_QUALITY)))
     return stem
+
+
+def _json_plain(o):
+    """numpy numbers and arrays as plain ones (a float32 among the results stopped a whole export, 2026-11-15)."""
+    if isinstance(o, np.generic):
+        return o.item()
+    if isinstance(o, np.ndarray):
+        return o.tolist()
+    raise TypeError(f"Object of type {type(o).__name__} is not JSON serializable")
 
 
 DOMAIN_VIEW_HALF = 0.08          # IR preview: the central flake's level +- this (contrast to the substrate); 2026-10-13:

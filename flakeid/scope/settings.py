@@ -11,11 +11,48 @@ from pathlib import Path
 
 @dataclass
 class Settings:
+    # which microscope: "mm" = through Micro-Manager (--mm, --cfg: the BX51 with the XC10 and the Oasis stage);
+    # "bx53m" = the glovebox BX53M through the vendors' libraries (flakeid/scope/hw: Tango stage, DP22 camera, BX3M-CBFM
+    # nosepiece; no Micro-Manager).  A hardware other than "mm" changes other defaults too: HARDWARE_DEFAULTS below
+    hardware: str = "mm"
+    tango_port: str = "COM3"                # bx53m: the Tango stage controller's serial port ...
+    tango_baud: int = 57600
+    tango_dll: str = ""                     # ... its library; "" = the copy in Olympus Stream (hw/tango.py DLL_PATH)
+    stage_xy_accel: float = 0.0             # bx53m: the Tango's X / Y acceleration while the program is connected, m/s2
+                                            # (0 = the controller's own, 0.6 on the glovebox stage); a loose chip slides
+                                            # at each start and stop
+    stage_z_vel: float = 0.0                # bx53m: the focus axis's velocity (motor rev/s) and acceleration (m/s2) while the
+    stage_z_accel: float = 0.0              # program is connected; 0 = the controller's own (5 and 0.1 on the glovebox stage)
+    stage_xy_scale: float = 1.0             # bx53m: real um per unit of the Tango's X / Y read-out (2.0 on the glovebox
+                                            # stage: its controller has half the real spindle pitch configured)
+    profile_raw: str = ""                   # the analysis's camera profile for raw tiles (flakeid/profiles/<name>.json or a
+                                            # path); "" = the XC10's (bx51_xc10_mm_raw16 ...)
+    camera_raw: bool = False                # bx53m: the scan and the analysis work with the DP22's raw, linear 12-bit
+                                            # frames (as the XC10's RAW16); wb_gains then apply to the colour pictures only
+    save_colour: bool = False               # ... and beside every saved raw picture the camera's own colour picture, as
+                                            # Olympus Stream shows it: colour.jpg in each tile's folder, <name>_colour.tif
+                                            # beside each 100x picture
+    colour_target: float = 0.486            # ... its exposure: the one that brings its median green to this (25 ms at
+                                            # 10x on empty 285 nm substrate at the lamp setting of 2026-11-13)
+    wb_gains: tuple = ()                    # bx53m: the DP22's white balance gains (R, G, B), set every time the camera
+                                            # is opened (it forgets them); () = as the camera is
+    stream_dir: str = ""                  # bx53m: Olympus Stream's folder (the DP22's library); "" = hw/dp22.py STREAM_DIR
+    max_z_move_um: float = 500.0            # bx53m: a single focus move larger than this is refused (the Tango has no Z
+                                            # limits configured; the software Z limits of hw/tango.py apply as well)
     # camera
     set_camera: bool = True
     exposure_ms: float = 3.0                # 10x; hBN on 285 nm: substrate green ~25 % of full scale
     auto_exposure: bool = False
     target_level: float = 0.25
+    exposure_sat_ok: float = 0.01           # auto exposure is content with up to this fraction of saturated places ...
+    exposure_sat_max: float = 0.05          # ... and the exposure check fails above this one ("overexposed")
+    sat_channels: str = "rgb"               # the channels whose saturation counts in the exposure check ("rg": a camera
+                                            # whose blue channel is at its top on bare substrate at the wanted exposure)
+    exposure_level_max: float = 0.85        # ... or with the frame level above this
+    level_channel: str = "green"            # the frame level (exposure check, auto exposure): the median of the green
+                                            # channel, or "max": of each place's brightest channel (a camera whose
+                                            # picture of the substrate is far from grey: its green would be set to
+                                            # target_level with another channel saturated)
     exposure_range: tuple = (0.05, 500.0)
     camera_props: tuple = (("Data format", "RAW16"), ("Device output data bit depth", "12"),
                            ("Image data bit depth", "12", "optional"), ("AEAG", "Off"), ("Auto white balance", "Off"),
@@ -160,6 +197,14 @@ class Settings:
     af_dev_per_mm: float = 0.5
     af_max_dev_cap: float = 8.0
     af_agree_um: float = 1.5
+    # focus drift over a long run (2026-11-17): each 100x start Z is the 10x focus + the 100x - 10x offset of the flakes
+    # focused before.  The offset drifts with time (glovebox BX53M, 20261117_1: +1.9 um/h during the scan, -1.2 um/h over
+    # the next 4 h, then +4 um/h), so the offsets are brought forward by the drift rate of the last
+    # focus_drift_window_min (Theil-Sen, clipped to +-10 um/h) and weighted down by age (half the weight every
+    # focus_drift_half_life_min).  A replay of that scan stretched to 4-12 h with such drifts: 95 % of start Z within
+    # 0.7-0.8 um (only by distance: 3-9 um, outside the +-2.4 um sweep).  0 = by distance only, as before
+    focus_drift_half_life_min: float = 15.0
+    focus_drift_window_min: float = 60.0
     # Pause / Resume (the main window's Pause button; 2026-10-27): at Resume the focus where the scan paused is measured
     # again (autofocus) and a change beyond pause_refocus_tol_um (10x, 100x) shifts every later Z by it (the coarse knob
     # is not seen by the drive); above pause_refocus_warn_um a message too.  pause_refocus False: no focus check
@@ -167,6 +212,14 @@ class Settings:
     pause_refocus_tol_um: tuple = (1.5, 0.5)
     pause_refocus_warn_um: float = 10.0
     af_extend: int = 2
+    af_metric: str = "mean"                 # sharpness of a colour frame: "mean" = the mean gradient (the XC10's raw frames);
+                                            # "top" = the strongest 1 % of the gradients at a quarter of the resolution (a
+                                            # noisy 8-bit picture: at 100x on the DP22 the focus stood 7-8x above the
+                                            # background with it, 1.15x with the mean)
+    # ... on a raw (mosaic) frame at 100x, the colour sites it is measured on: "green" (as before), "red", "blue".  The
+    # glovebox 100x objective focuses red ~1 um higher than green/blue; Stream's view (sharp) was at red's best focus,
+    # the green sites' best focus was visibly soft (2026-11-17).  The 10x always uses green (depth of field ~8 um)
+    af100_channel: str = "green"
     af_min_ratio: float = 1.10
     af_backlash_um: float = 5.0
     spike_factor: float = 3.0
@@ -188,6 +241,10 @@ class Settings:
     target_exposure_ms: float = 27.0
     target_auto_exposure: bool = False
     target_box_margin_um: float = 2000.0
+    # the 100x objective against the 10x one (flakeid/hwconst.py; the BX51's measured values): 100x pixels per 10x pixel,
+    # and the stage move (um) that puts under the 100x objective what was centred at 10x
+    ratio_100x: float = 9.54
+    offset_100x_um: tuple = (24.0, -18.3)
     focus_offset_um: float = -42.0          # 100x focus Z minus 10x focus Z (real um); NaN = measured at the first flake
     hundred_shifts_um: object = ((10.0, 0.0), (0.0, 10.0))
     hundred_save_frames: bool = False      # also save every frame averaged into a flake's 100x image (<file>_f1.tif ...)
@@ -388,6 +445,28 @@ class Settings:
     copy_results_to: str = ""               # where the results (viewers, records) are copied at the end; "" = asked
     upload_each_chip: bool = True           # each piece copied there as soon as its 100x export ends (the designer adds
                                             # it while the next pieces are imaged); the rest at the end
+    # a faint region surrounded by similar haze (glue) is kept as a flake if its own outline is this compact (solidity,
+    # 0..1; 0 = off: left out as residue).  flakeid.pipeline.RESIDUE_RING_SOLIDITY
+    residue_ring_solidity: float = 0.0
+    faint_flakes: bool = False              # the analysis keeps faint flat films with a sharp edge that the faint-residue
+                                            # rules (low_contrast, residue_like) would leave out (flakeid.pipeline
+                                            # FAINT_FLAKES; the glovebox scanner turns it on)
+    strict_uniformity_um: float = 0.0       # the analysis leaves out regions without a uniform disc of this diameter (um)
+                                            # or with an irregular shape (tape glue; 0 = off: the irregular ones are
+                                            # kept and scored, as the BX51's labels wanted)
+    # 100x targets, the analysis's cuts (None / () = its defaults: score 0.75, best terrace 30 um wide, hBN 0-100 nm)
+    target_min_score: object = None         # flakeid.live --min-score
+    target_min_d_um: object = None          # flakeid.live --min-d
+    hbn_range_nm: tuple = ()                # the hBN thickness window of the 10x analysis (min, max)
+    real100: str = ""                       # after the 100x export every 100x picture judged real flake or glue from its raw
+                                            # frame (flakeid/real100.py): "judge" = only the list (real100.csv); "sort" =
+                                            # the glue pictures moved to <piece>_100x/rejected/ as well; "" = not judged
+    # ... how picky (flakeid.real100.judge): the least probability of a real flake (lower keeps doubtful ones); the least
+    # share of the flake that is flat and clean, 0..1 (speckled or dirty flakes: 0.2-0.4, clean ones 0.75 up; 0 = any);
+    # the least area of the flake, um2 (0 = any).  The kept flakes' colour pictures go to <results>/<piece>/real_flakes/
+    real100_cut: float = 0.5
+    flake_min_flat: float = 0.0
+    flake_min_area_um2: float = 0.0
     min_targets: int = 10                   # 100x: at least this many flakes per piece, the best-scoring ones even if they
                                             # score below the cut (e.g. graphite on 285 nm oxide); 0 = only those above it
     # 100x targets per piece in proportion to its area (found by the edge walk): targets_per_cm2 x area, at least
@@ -485,6 +564,19 @@ class Settings:
     device_photos_to: str = ""              # without a stack folder: where the device folders are copied; "" =
                                             # <copy_results_to>/../device_photos
     nosepiece_port: str = ""                # e.g. "COM1"; "" = no nosepiece reading
+    nosepiece_type: str = "ucbs"            # "ucbs": coded nosepiece, read only (nosepiece.py); "cbfm": the BX53M's
+                                            # motorised one through the BX3M-CBFM box (hw/cbfm.py)
+    # bx53m: the light set by the program through the nosepiece's control box when a job (or the live view) opens the
+    # microscope: "brightfield" (the reflected-light lamp at illumination_level 0..255, the MIX ring off), "darkfield"
+    # (the ring), "mix" (both), "" = left as it is.  The box stays logged in during the job; at its end it goes back to
+    # its hand-switch state (on the glovebox microscope: the ring on, the lamp dark)
+    illumination: str = ""
+    illumination_level: int = 224
+    nosepiece_retract_um: float = 0.0       # ... before it turns to the 50x or 100x objective the focus is lowered by
+                                            # this much (the stage away from the objective); the job focuses afterwards
+    nosepiece_auto: bool = False            # a motorised nosepiece is turned by the program when it needs another
+                                            # objective (the stage is NOT lowered first); False: the window waits for
+                                            # you to change it, as with a coded nosepiece
     objective_positions: object = None      # e.g. {"10x": 2, "100x": 5}
     # display
     live_scale: float = 0.5                 # live view at this fraction of the camera resolution
@@ -497,7 +589,10 @@ class Settings:
     # only (no pictures of its own), at most ~2 a second.  Its "Show the camera" box changes it (remembered in
     # <local_root>/show_camera.json)
     show_camera: bool = True
-    display_level: float = 0.31             # substrate brightness in the live view (as the chip viewers)
+    display_level: float = 0.31             # substrate brightness in the live view (as the chip viewers); 0 = the
+                                            # camera's picture shown as it is (a camera that delivers a finished picture)
+    live_ae_target: float = 0.0             # the live views' Auto exposure: the picture's median green brought to this
+                                            # fraction of full scale; 0 = its brightest part to ~70 % (the XC10)
 
 
 # Scan profiles (the Chips window): the settings each one changes for the job.  The window's own boxes (targets per cm2,
@@ -544,12 +639,80 @@ def apply_profile(s, name) -> bool:
     return True
 
 
+# Defaults that differ from the Settings above for a hardware other than "mm" (the settings file and the command line
+# still override them).
+HARDWARE_DEFAULTS = {
+    "bx53m": dict(
+        camera_props=(),                    # the DP22 has no settable properties here (exposure only)
+        # raw mode: linear 12-bit frames with the black level at 128, as the XC10's (hw/bx53m.py), and beside each saved
+        # one the camera's own colour picture as Olympus Stream shows it: white balance 2.07 / 1 / 1 and the exposure
+        # Stream's auto exposure gives (25 ms at 10x on empty 285 nm substrate, median green 124 of 255: colour_target)
+        camera_raw=True, save_colour=True, wb_gains=(2.07, 1.0, 1.0),
+        residue_ring_solidity=0.85,             # a clean thin flake beside glue is not residue (raw_3 picture 21)
+        profile_raw="bx53m_dp22_raw_led",       # LED colour model fitted to one hBN chip (2026-11-16): not checked against AFM
+        # raw frames: the substrate's green at 20 % of full scale (blue is 2.3x green on 285 nm oxide: 47 %, and a flake
+        # 1.7x brighter than the substrate still fits); set from the picture at each piece (the lamp is not constant)
+        exposure_ms=12.0, auto_exposure=True, target_level=0.20,
+        # (strict_uniformity_um, 20 um, was a workaround for the camera's processed picture: it also switched the
+        # residue rules off.  On raw frames the original rules work: of 27 glue patches imaged at 100x on 2026-11-15 they
+        # reject 24, and keep two of the three real flakes; so it is off, the default)
+        # 100x: Olympus Stream's pixel sizes (585.714 and 58.571 nm) give exactly 10; the focus calibration gave the
+        # 100x focus 10-11 um below the 10x one; the XY offset: measured with python -m flakeid.scope.hw.offset100
+        ratio_100x=10.0, offset_100x_um=(21.1, -38.4), focus_offset_um=-10.0,   # offset measured 2026-11-15
+        target_exposure_ms=80.0, target_auto_exposure=True,
+        # 100x autofocus on the red sites (2026-11-17): green's best focus was 0.86-0.93 um below red's at two flakes and
+        # visibly soft; red's matched Olympus Stream's view
+        af100_channel="red",
+        # the first 100x runs here (2026-11-15): more targets than the score alone gives (it is not calibrated for this
+        # camera: 2 flakes above its cut), the plain picture of each (no shifted frames, mosaics or coordinate check),
+        # the raw pictures kept, and no wide focus searches with the 100x objective in (the long search +-80 um and
+        # the retakes' +-120 um: a failed autofocus asks for the focus by hand instead)
+        # 10x generous, 100x decides (2026-11-15): until the colour model is calibrated for this camera the 10x score
+        # and thickness do not choose: every flake that passes the 10x rules is a 100x target (up to the targets per
+        # cm2), best terrace 15 um wide or more, any thickness the model reads up to 400 nm
+        target_min_score=0.0, target_min_d_um=15.0, hbn_range_nm=(0.0, 400.0), targets_per_cm2=300.0,
+        real100="sort",                         # ... and 100x decides: glue pictures go to <piece>_100x/rejected/
+        min_targets=0, coord_check=False, hundred_mosaic=False, hundred_shifts_um=(), keep_tiles=True,
+        af_long_after=0, af_retake=(15.0, 1.0, 1.0, 0.25, 0.9), af_retake_extend=0,
+        nosepiece_retract_um=30.0,
+        z_stepsize_um=0.0, z_scale=1.0,     # the Tango's Z is in um
+        overlap_z_move=False,               # the Tango drops a move sent while another axis moves
+        stage_xy_scale=2.0,
+        # a chip lying loose on the stage slid at every move with the controller's 0.6 m/s2 (25 um after 24 moves of
+        # 300 um); at 0.2 and below it stayed within 1 um (2026-11-13).  0.1: about 0.05 s more per move
+        stage_xy_accel=0.1,
+        # the focus axis has no encoder and lost position at the controller's speed: the in-focus Z of one flake went
+        # 269 -> 331 -> 429 um over a 100x run (3700 focus moves) and tests.  100 cycles of 5 um down and up, 2026-11-15:
+        # fast (5 rev/s, 0.1 m/s2) 0, +3, +3, +4, 0 um; at 0.5 rev/s and 0.01 m/s2: 0 in five rounds
+        stage_z_vel=0.5, stage_z_accel=0.01,
+        af_metric="top",
+        # 10x pixel -> stage um: Olympus Stream's calibration (585.714 nm per pixel: 3.69 um pixels, 0.63x adapter).
+        # Measured 2026-11-13 (python -m flakeid.scope.hw.calibrate, 150 um steps): 0.589 um per pixel, both signs
+        # negative, rotation below 0.5 degrees
+        M=((-0.5857, 0.0), (0.0, -0.5857)),
+        illumination="brightfield",
+        nosepiece_type="cbfm", nosepiece_port="COM4",
+        nosepiece_auto=True,                # this microscope has no hand switch: only a program can turn the nosepiece
+        objective_positions={"5x": 1, "10x": 2, "20x": 3, "50x": 4, "100x": 5},   # position 6: empty
+        domain_imaging="no",                # no IR camera
+        substrate_colour_check="off",       # no colour references for this camera
+        log_upload=False,
+        update_repo="",                     # "Update..." would replace this fork's code with afylab/Flake-Finder's
+    ),
+}
+
+
 def load(path=None, **overrides) -> Settings:
     s = Settings()
     d = {}
     if path:
         d.update(json.loads(Path(path).read_text()))
     d.update({k: v for k, v in overrides.items() if v is not None})
+    hw = str(d.get("hardware", s.hardware))
+    if hw != "mm":
+        if hw not in HARDWARE_DEFAULTS:
+            raise ValueError(f"unknown hardware {hw!r}: mm, " + ", ".join(HARDWARE_DEFAULTS))
+        d = dict(HARDWARE_DEFAULTS[hw], **d)
     names = {f.name for f in fields(Settings)}
     bad = [k for k in d if k not in names]
     if bad:

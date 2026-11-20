@@ -10,6 +10,10 @@ coded nosepiece, run through Micro-Manager on a Windows 7 PC with Python 3.8. An
 Micro-Manager configuration, camera calibration and flat fields, and some of the settings in
 `flakeid/scope/settings.py` adapted.
 
+A second setup is being added: the glovebox Olympus BX53M (Märzhäuser Tango stage, Olympus DP22 camera, motorised
+nosepiece), driven through the vendors' libraries without Micro-Manager (`flakeid/scope/hw/`, `--hw bx53m`). The
+hardware layer works; calibration and the 100x part do not yet. See [docs/bx53m.md](docs/bx53m.md).
+
 **Status.** In daily use in the lab and changing quickly; see [CHANGELOG.md](CHANGELOG.md).
 
 1. **Scan** (microscope PC): an Olympus BX51 with an XIMEA XC10 camera and an Oasis stage, driven from Python through

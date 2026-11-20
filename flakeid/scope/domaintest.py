@@ -22,6 +22,8 @@ The stage ends at the feature with the IR configuration in place; the scan camer
 """
 from __future__ import annotations
 
+from flakeid.hwconst import OFFSET_100X, RATIO_100X  # noqa: F401  (the microscope's 100x ratio and offset)
+
 import datetime
 import json
 import math
@@ -118,7 +120,7 @@ def run_domain_test(sc):
     sc.open_log(out / "domaintest_log.txt")
     say = sc.say
     say(f"domain camera test -> {out}")
-    M100 = np.asarray(sc.M, float) / 9.54                       # 100x pixel -> stage (um per px), the scan's convention
+    M100 = np.asarray(sc.M, float) / RATIO_100X                       # 100x pixel -> stage (um per px), the scan's convention
     cam100 = c.getCameraDevice()
     M_scan, vs_scan = sc.M.copy(), getattr(sc, "view_scale", 1.0)
     cams = None
@@ -187,7 +189,7 @@ def run_domain_test(sc):
         # ---- 3. the IR camera
         cams = sc.setup_domain_camera()
         cam_scan, exp_scan, wh_scan, camD, fsD = cams
-        sc.view_scale = 1.0 / 9.54                               # (the live view's stage steps until the IR pixel is known)
+        sc.view_scale = 1.0 / RATIO_100X                               # (the live view's stage steps until the IR pixel is known)
         g0 = avg()
         bayerD = False
         for _ in range(8):                                       # saturated: a shorter exposure (cameras whose exposure works)

@@ -1,0 +1,64 @@
+{
+ "camera": {
+  "lamp_temp_k": 3100.0,
+  "centers_nm": [
+   623.063612470426,
+   510.67207481873766,
+   458.37653898182964
+  ],
+  "fwhm_nm": [
+   60.95031566869105,
+   75.54523508547084,
+   70.0
+  ],
+  "ir_cut_nm": 649.2173473085396,
+  "gamma": 1.0,
+  "ccm": [
+   [
+    1.0,
+    0.0,
+    0.0
+   ],
+   [
+    0.0,
+    1.0,
+    0.0
+   ],
+   [
+    0.0,
+    0.0,
+    1.0
+   ]
+  ],
+  "flare": [
+   0.1804084425283993,
+   0.06322661874840313,
+   0.0
+  ]
+ },
+ "na": 0.3,
+ "notes": "TRIAL, NOT VALIDATED.  Glovebox BX53M, Olympus DP22 in raw mode (linear 12-bit mosaic, contrast mode 3, gains 1/1/1, black level shifted to 128), MPLN10x (NA 0.25; fitted with the tool's 0.30), no flat field.  Unsupervised fit (python -m flakeid.calibrate --tone flare --no-ccm --maxiter 60) to 30 tiles of one hBN chip on nominal 285 nm SiO2, 2026-11-15.  With it flakes are found, but the thicknesses bunch near 2 and 94 nm: do not trust them.  To be refitted with a flat field, whole scans and flakes of known thickness.",
+ "materials": {},
+ "calibration": {
+  "same_settings": false,
+  "fitted_oxide_nm": {
+   "raw_2 (30 tiles)": 308.8
+  },
+  "params": {
+   "f_r": 0.1804,
+   "f_g": 0.0632,
+   "f_b": 0.0,
+   "c_r": 623.0636,
+   "c_g": 510.6721,
+   "c_b": 458.3765,
+   "w_r": 60.9503,
+   "w_g": 75.5452,
+   "w_b": 70.0,
+   "ir_cut": 649.2173,
+   "gr_n550": 2.471,
+   "gr_k550": 1.2836,
+   "gr_kslope": -0.0248,
+   "oxide_0": 1.0836
+  }
+ }
+}

@@ -1,0 +1,50 @@
+{
+ "camera": {
+  "lamp_temp_k": 3100.0,
+  "centers_nm": [
+   628.4073776481397,
+   528.2716362902845,
+   452.60115329704604
+  ],
+  "fwhm_nm": [
+   60.251203723221934,
+   91.95345520125652,
+   84.31614172733205
+  ],
+  "ir_cut_nm": 630.2,
+  "gamma": 1.0,
+  "ccm": [
+   [
+    1.0,
+    0.0,
+    0.0
+   ],
+   [
+    0.0,
+    1.0,
+    0.0
+   ],
+   [
+    0.0,
+    0.0,
+    1.0
+   ]
+  ],
+  "flare": [
+   0.165,
+   0.085,
+   0.023
+  ],
+  "led": [
+   450.0,
+   22.0,
+   547.9,
+   90.2,
+   8.95
+  ]
+ },
+ "na": 0.88,
+ "notes": "Glovebox BX53M + DP22 raw mosaic, 100x (NA 0.90), white LED: the 10x profile bx53m_dp22_raw_led with the light cone, stray light and the lamp's spectrum through the 100x fitted to the 100x colours of 70 hBN regions whose 10x thickness has one reading (one chip, 2026-11-16; tools/bx53m/check100_colour_trial.py --lamp: residual median 0.053).  Used by flakeid.gscan.colour100 to choose between the thicknesses one 10x colour can be.  NOT checked against AFM; the lamp terms were fitted from 10x thicknesses.",
+ "materials": {},
+ "saturation_counts": 3540.0
+}

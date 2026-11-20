@@ -12,6 +12,8 @@ their contrast colours, as in the chip viewers; "Enhanced" stretches the contras
 """
 from __future__ import annotations
 
+from flakeid.hwconst import OFFSET_100X, RATIO_100X  # noqa: F401  (the microscope's 100x ratio and offset)
+
 import json
 import os
 import queue
@@ -139,6 +141,13 @@ def to_display(frame, dark, sub=None, level=0.31, enhanced=False, scale=0.5, fla
     import cv2
     from ..mm import BAYER_CODE
     a = np.asarray(frame)
+    if level <= 0 and a.ndim == 3 and a.dtype == np.uint8 and not enhanced:
+        # (display_level 0: a camera that delivers a finished colour picture, shown as it is: its own white balance
+        # and exposure, no substrate normalisation)
+        rgb = np.ascontiguousarray(a[..., :3])
+        if scale != 1.0:
+            rgb = cv2.resize(rgb, (max(1, int(rgb.shape[1] * scale)), max(1, int(rgb.shape[0] * scale))), interpolation=cv2.INTER_AREA)
+        return rgb, (np.ones(3, np.float32) if sub is None or sub is False else np.asarray(sub, np.float32))
     bayer = a.ndim == 2 and a.dtype == np.uint16 and a.shape[0] % 2 == 0 and a.shape[1] % 2 == 0 and not mono
     if bayer and scale == 0.5:
         rgb = bayer_half(a)                                      # (flat: a half_flat)
@@ -1023,6 +1032,7 @@ class TkUI:
             except Exception:
                 pass
             if not keep:                                 # (the start screen holds no device: Stream Motion can use them)
+                sc.close_nosepiece()                     # (and the control box logged out: its light as by hand again)
                 self.release_microscope(wait=False)
         ttk.Button(ef, text="Close", width=8, command=close).pack(side="right")
         w.protocol("WM_DELETE_WINDOW", close)
@@ -3954,6 +3964,15 @@ class LiveView:
         self.t_ae = now
         a = np.asarray(fr)
         a = a[::4, ::4]
+        tgt = float(getattr(self.sc.s, "live_ae_target", 0.0) or 0.0)
+        if tgt > 0 and a.ndim == 3:
+            # (as the scan's own auto exposure: the picture's median green brought to this level, e.g. the one Olympus
+            # Stream's auto exposure gives on empty substrate)
+            lvl = float(np.median(a[..., 1])) / 255.0
+            if abs(lvl / tgt - 1.0) <= 0.04:
+                return
+            self._set_exp(float(self.sc.core.getExposure()) * min(max(tgt / max(lvl, 1e-3), 0.5), 2.0) ** 0.8)
+            return
         top = float(np.percentile(a, 99.5))
         fs = 255.0 if a.dtype == np.uint8 else float(self.sc.full_scale())
         dk = float(np.mean(self.dark)) if np.ndim(self.dark) else float(self.dark or 0.0)
@@ -4040,7 +4059,7 @@ class LiveView:
     def objective_in_view(self):
         """The objective the view is set for ("100x", "10x", "50x", ...: from view_scale, set_mag)."""
         vs = float(getattr(self.sc, "view_scale", 1.0))
-        return "100x" if abs(vs * 9.54 - 1) < 1e-3 else f"{10.0 / vs:g}x"
+        return "100x" if abs(vs * RATIO_100X - 1) < 1e-3 else f"{10.0 / vs:g}x"
 
     def um_per_px(self, disp_scale):
         """um per pixel of the shown picture: the scale bar calibration of the objective in use (scalecal: a slide with
@@ -4289,14 +4308,14 @@ class LiveView:
         except ValueError:
             return
         self.sc.objective_now = name
-        self.sc.view_scale = 1.0 / 9.54 if abs(mag - 100) < 1e-6 else 10.0 / mag
+        self.sc.view_scale = 1.0 / RATIO_100X if abs(mag - 100) < 1e-6 else 10.0 / mag
         self.flat = self._load_flat(self.sc) if mag in (10.0, 100.0) else None
         self.flat_half = half_flat(self.flat) if self.flat is not None else None
         self.sub = None                                              # (the colour balance again for that objective)
 
     def set_objective(self, hundred):
         """Stage steps and flat field for the 10x or the 100x objective."""
-        self.sc.view_scale = 1.0 / 9.54 if hundred else 1.0
+        self.sc.view_scale = 1.0 / RATIO_100X if hundred else 1.0
         self.flat = self._load_flat(self.sc)
         self.flat_half = half_flat(self.flat) if self.flat is not None else None
 

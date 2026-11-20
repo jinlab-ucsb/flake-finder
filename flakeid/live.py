@@ -25,6 +25,8 @@ order, one every --interval seconds, to reproduce a scan.
 """
 from __future__ import annotations
 
+from flakeid.hwconst import OFFSET_100X, RATIO_100X  # noqa: F401  (the microscope's 100x ratio and offset)
+
 import argparse
 import csv
 import json
@@ -1439,7 +1441,7 @@ def write_alt_targets(rows, sel, rank, max_targets, filt, dsts, offset, focus10,
             t["alt"] = "add" if fid in alt_ids else "drop"
             t["rank_score"] = places["score"].get(fid, "")
             t["rank_size"] = places["size"].get(fid, "")
-    cols = list(recs[0]) if recs else TARGET_COLUMNS + ["alt", "rank_score", "rank_size"]
+    cols = list(dict.fromkeys(k for t in recs for k in t)) if recs else TARGET_COLUMNS + ["alt", "rank_score", "rank_size"]    # (not every row has p_keep100)
     for dst in dsts:
         write_target_csv(dst, recs, cols)
     log(f"ranking '{other}' instead of '{rank}' (comparison only): {len(add)} other flakes in, {len(drop)} of these "
@@ -1456,7 +1458,7 @@ def write_target_crops(cc, tg, offset, out_dir, half=180):
     Minv, P0, O, wh = np.array(cc["Minv"]), np.array(cc["P0"]), np.array(cc["O"]), np.array(cc["wh"], float)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    fw, fh = wh / 9.54                                     # the 100x field in 10x pixels (same camera)
+    fw, fh = wh / RATIO_100X                                     # the 100x field in 10x pixels (same camera)
     for t in tg:
         q = np.array([t["stage_x_um"] - offset[0], t["stage_y_um"] - offset[1]])     # 10x stage position
         cx, cy = (Minv @ (q - P0) + wh / 2 - O).round().astype(int)
@@ -1691,6 +1693,21 @@ def export_100x(run_dir: Path, man_path: Path, manifest, viewers: dict, a, log=p
                    workers=2 if busy else None, positions=not getattr(a, "no_100x_positions", False))
         except Exception as exc:
             log(f"{name}: 100x export failed ({type(exc).__name__}: {exc}); the 100x TIFFs are kept")
+        # real flake or glue (flakeid.real100; environment FLAKEID_REAL100 = judge | sort, the scan setting real100): every
+        # 100x picture judged from its raw frame (real100.csv, copied beside the viewer); "sort": the glue pictures and
+        # their colour copies moved into <piece>_100x/rejected/
+        mode100 = os.environ.get("FLAKEID_REAL100", "").lower()
+        if mode100 in ("judge", "sort") and not second:
+            try:
+                from . import real100
+                verdicts = real100.judge(f100, log=log)
+                if verdicts:
+                    shutil.copy2(str(Path(f100) / "real100.csv"), str(Path(vdir).parent / f"{name}_real100.csv"))
+                    real100.collect(f100, verdicts, Path(vdir).parent / "real_flakes", log=log)
+                    if mode100 == "sort":
+                        real100.sort(f100, verdicts, log=log)
+            except Exception as exc:
+                log(f"{name}: real flake / glue sorting failed ({type(exc).__name__}: {exc}); every picture kept")
         mark_exported(Path(vdir).parent, "ir" if second else "100x")
     log("100x images go into the viewers as each piece's 100x imaging ends")
     while True:
@@ -1994,7 +2011,7 @@ def main(argv=None):
     p.add_argument("--thickness", action="append", default=[], metavar="[MATERIAL:]MAX or [MATERIAL:]MIN-MAX",
                    help="target list: only flakes whose best terrace is at most MAX nm thick (or within MIN-MAX), for every "
                         "material or per material, e.g. --thickness hbn:80 (all hBN up to 80 nm; graphite unlimited)")
-    p.add_argument("--offset", nargs=2, type=float, default=(24.0, -18.3), metavar=("DX", "DY"),
+    p.add_argument("--offset", nargs=2, type=float, default=OFFSET_100X, metavar=("DX", "DY"),
                    help="10x -> 100x objective offset added to the targets (stage um; default 24.0 -18.3)")
     p.add_argument("--no-designer", action="store_true", help=argparse.SUPPRESS)   # (ignored: the designer builds its runs)
     p.add_argument("--no-viewer", action="store_true",

@@ -39,6 +39,8 @@ picture) stay as they are: the designer keeps drawing the old pictures on the ol
 """
 from __future__ import annotations
 
+from flakeid.hwconst import OFFSET_100X, RATIO_100X  # noqa: F401  (the microscope's 100x ratio and offset)
+
 import csv
 import io
 import json
@@ -50,7 +52,7 @@ from pathlib import Path
 
 import numpy as np
 
-OFFSET_100X = (24.0, -18.3)         # 10x -> 100x stage offset (flakeid.hundred.OFFSET_100X: the analysis's default)
+# (OFFSET_100X: flakeid.hwconst)         # 10x -> 100x stage offset (flakeid.hundred.OFFSET_100X: the analysis's default)
 MIN_INLIERS = 25                    # whole-image feature matches a piece pair needs to count as the same chip
 OVERVIEW_DOWN = 4                   # the whole-image match: the viewer pyramid level at 1/4 (~4.4 um per pixel)
 PATCH_PX = 256                      # full-resolution patches of the fine match (~280 um)
@@ -905,7 +907,7 @@ def visit_targets(piece):
         except (OSError, ValueError, KeyError, TypeError):
             continue
         z100, z10 = zs.get(stem, (None, None))
-        out.append(dict(flake_id=fid, stem=stem, picture=str(pic), c_old=c, o100=o, um_px=float(R.get("px_um") or 1.09 / 9.54),
+        out.append(dict(flake_id=fid, stem=stem, picture=str(pic), c_old=c, o100=o, um_px=float(R.get("px_um") or 1.09 / RATIO_100X),
                         frame_wh=list(R.get("frame_wh") or (1376, 1038)), z100_old=z100, z10_old=z10))
         seen.add(fid)
     return out

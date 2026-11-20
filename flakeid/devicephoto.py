@@ -21,6 +21,8 @@ The scan program saves, per photo, the frame-averaged raw picture (<n>_<objectiv
 """
 from __future__ import annotations
 
+from flakeid.hwconst import OFFSET_100X, RATIO_100X  # noqa: F401  (the microscope's 100x ratio and offset)
+
 import argparse
 import csv
 import html
@@ -35,7 +37,7 @@ from .hundred import (DEMO_SUBSTRATE, WHITE_BY_MATERIAL, _flatten, _mode_rgb, _u
 MAG = {"100x": 100.0, "50x": 50.0, "10x": 10.0, "5x": 5.0}
 ORDER = ("100x", "50x", "10x", "5x")
 UM_PER_PX_10X = 1.0911            # (flakeid.mm.DEFAULT_M: 10x, BX51 + XC10); other objectives scaled by magnification
-RATIO = {"100x": 9.54}            # measured 100x / 10x pixel ratio; the others nominal
+RATIO = {"100x": RATIO_100X}            # measured 100x / 10x pixel ratio; the others nominal
 TERRACE_TOL = 0.035               # a terrace: colour within 3.5 % of its centre colour (smoothed 2 px)
 MIN_UM2 = 12.0                    # terraces smaller than this are not listed (~2500 px at 100x)
 MAX_TERRACES = 8

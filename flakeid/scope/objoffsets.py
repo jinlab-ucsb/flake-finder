@@ -18,6 +18,8 @@ Offsets: (dx, dy, dz) = the stage position and focus of the feature with that ob
 """
 from __future__ import annotations
 
+from flakeid.hwconst import OFFSET_100X, RATIO_100X  # noqa: F401  (the microscope's 100x ratio and offset)
+
 import datetime
 import json
 import math
@@ -79,7 +81,7 @@ def pixel_um(s, obj):
 # ---------------------------------------------------------------------------------------------- the tool
 def nominal_M(M10, obj):
     """um per camera pixel from the scan's 10x matrix M10, scaled by magnification (100x: the measured 9.54)."""
-    k = 9.54 if obj == "100x" else MAG[obj] / 10.0
+    k = RATIO_100X if obj == "100x" else MAG[obj] / 10.0
     return np.asarray(M10, float) / k
 
 

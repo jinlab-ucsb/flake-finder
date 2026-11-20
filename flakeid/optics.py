@@ -132,9 +132,16 @@ class CameraModel:
     gamma: float = 1.0                          # encoded = linear ** (1/gamma)
     ccm: tuple | None = None                    # 3x3 colour-correction matrix on linear RGB
     flare: tuple = (0.0, 0.0, 0.0)              # stray light per channel, in reflectance units
+    # a white LED instead of the halogen lamp (the glovebox BX53M): (blue peak nm, its FWHM, phosphor centre nm, its
+    # FWHM, blue peak height / phosphor peak height); None = the blackbody of lamp_temp_k
+    led: tuple | None = None
 
     def weights(self, wl):
-        lamp = blackbody(wl, self.lamp_temp_k)
+        if self.led:
+            bp, bw, pc, pw, ratio = self.led
+            lamp = ratio * gaussian(wl, bp, bw) + gaussian(wl, pc, pw)
+        else:
+            lamp = blackbody(wl, self.lamp_temp_k)
         ircut = 1.0 / (1.0 + np.exp((wl - self.ir_cut_nm) / 8.0))
         w = np.stack([gaussian(wl, c, f) for c, f in zip(self.centers_nm, self.fwhm_nm)])
         w = w * lamp * ircut

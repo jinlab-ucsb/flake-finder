@@ -31,6 +31,8 @@ always stage - pos_d, and doing it again (a second export, a re-image) only appl
 """
 from __future__ import annotations
 
+from flakeid.hwconst import OFFSET_100X, RATIO_100X  # noqa: F401  (the microscope's 100x ratio and offset)
+
 import csv
 import io
 import json
@@ -133,7 +135,7 @@ def _crop_file(path, frame_wh):
     if bgr is None:
         return None
     h, w = bgr.shape[:2]
-    fw, fh = frame_wh[0] / 9.54, frame_wh[1] / 9.54
+    fw, fh = frame_wh[0] / RATIO_100X, frame_wh[1] / RATIO_100X
     marks = np.zeros((h, w), np.uint8)
     cv2.rectangle(marks, (int(w / 2 - fw / 2), int(h / 2 - fh / 2)), (int(w / 2 + fw / 2), int(h / 2 + fh / 2)), 1, 6)
     cv2.drawMarker(marks, (w // 2, h // 2), 1, cv2.MARKER_CROSS, 18, 5)

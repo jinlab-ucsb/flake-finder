@@ -10,6 +10,8 @@ option --flat-domain), so their grey levels are contrast to a flat substrate wha
 """
 from __future__ import annotations
 
+from flakeid.hwconst import OFFSET_100X, RATIO_100X  # noqa: F401  (the microscope's 100x ratio and offset)
+
 import datetime
 import json
 from pathlib import Path
@@ -51,7 +53,7 @@ def run_domain_flat(sc):
         if sc.has_z:
             sc.zref = sc.z_read()
         nfr = max(1, s.domain_frames)
-        fov = max(sc.FOVX, sc.FOVY) / 9.54                     # the 100x field (the IR field is about the same)
+        fov = max(sc.FOVX, sc.FOVY) / RATIO_100X                     # the 100x field (the IR field is about the same)
         step = s.flat_step_um if s.flat_step_um > 0 else 1.1 * fov
         say(f"IR flat field ({camD}): {s.flat_frames} positions {f1(step)} um apart around {f1(X0)}, {f1(Y0)}, {nfr} frames each, "
             f"focus {s.flat_focus} -> {out}")

@@ -55,6 +55,11 @@ def graphite_table(n550, k550, k_slope, n_slope=0.10):
 
 PARAMS_GAMMA = [("gamma", 1.6, 2.6)]
 PARAMS_FLARE = [("f_r", 0.0, 0.4), ("f_g", 0.0, 0.4), ("f_b", 0.0, 0.4)]
+# --lamp led: a white LED (blue peak at 450 nm, 22 nm wide, + a broad phosphor band) instead of the halogen blackbody
+PARAMS_LED = [("led_ratio", 0.2, 5.0), ("led_pc", 530.0, 610.0), ("led_pw", 90.0, 190.0)]
+LED_BLUE = (450.0, 22.0)
+# --wide: wider ranges for the channels of a camera other than the XC10
+WIDE = {"c_r": (570, 650), "c_g": (495, 565), "c_b": (425, 495), "w_r": (30, 140), "w_g": (30, 140), "w_b": (30, 140), "ir_cut": (620, 720)}
 PARAMS = [  # name, low, high  (bounds keep the camera physically plausible)
     ("c_r", 585, 630), ("c_g", 510, 555), ("c_b", 440, 480),
     ("w_r", 60, 120), ("w_g", 70, 130), ("w_b", 70, 130),
@@ -74,10 +79,22 @@ def camera_from_params(p):
     return CameraModel(gamma=p.get("gamma", 1.0), centers_nm=(p["c_r"], p["c_g"], p["c_b"]),
                        fwhm_nm=(p["w_r"], p["w_g"], p["w_b"]), ir_cut_nm=p["ir_cut"],
                        ccm=tuple(map(tuple, ccm.round(5))),
-                       flare=(p.get("f_r", 0.0), p.get("f_g", 0.0), p.get("f_b", 0.0)))
+                       flare=(p.get("f_r", 0.0), p.get("f_g", 0.0), p.get("f_b", 0.0)),
+                       led=(LED_BLUE[0], LED_BLUE[1], p["led_pc"], p["led_pw"], p["led_ratio"]) if "led_ratio" in p else None)
+
+
+def _na():
+    """The objective's numerical aperture for the fit (--na; through the environment: the fit runs in worker processes)."""
+    import os
+    try:
+        return float(os.environ["FLAKEID_CAL_NA"])
+    except (KeyError, ValueError):
+        return None
 
 
 def _model(p, material, oxide, **kw):
+    if _na() is not None:
+        kw.setdefault("na", _na())
     return ContrastModel(material, oxide, camera=camera_from_params(p), n_angles=3,
                          wl=np.arange(400.0, 721.0, 10.0),
                          index_table=graphite_table(p["gr_n550"], p["gr_k550"], p["gr_kslope"])
@@ -113,12 +130,16 @@ class _Loss:
 
 
 def fit(datasets, substrate_pairs=(), trim=0.7, maxiter=80, seed=1, w_sub=20.0, verbose=True, tone="flare",
-        ccm=True):
+        ccm=True, led=False, wide=False):
     """datasets: list of (samples (N,3), material, nominal oxide nm, substrate_rgb (3,)).
     substrate_pairs: (i, j) dataset indices imaged with identical camera settings;
     the ratio of their substrate colours constrains the camera model."""
     extra = PARAMS_FLARE if tone == "flare" else PARAMS_GAMMA
     base = [q for q in PARAMS if ccm or not q[0].startswith("m_")]
+    if wide:
+        base = [(n, *WIDE[n]) if n in WIDE else (n, lo, hi) for n, lo, hi in base]
+    if led:
+        base = PARAMS_LED + base
     names = [q[0] for q in extra + base] + [f"oxide_{i}" for i in range(len(datasets))]
     bounds = [(lo, hi) for _, lo, hi in extra + base] + [(0.9, 1.1)] * len(datasets)
     loss = _Loss(names, datasets, substrate_pairs, trim, w_sub)
@@ -141,9 +162,14 @@ def main(argv=None):
     ap.add_argument("--maxiter", type=int, default=80)
     ap.add_argument("--tone", choices=["flare", "gamma"], default="flare",
                     help="contrast-compression model: stray light (physical, linear data) or a tone curve")
+    ap.add_argument("--lamp", choices=["halogen", "led"], default="halogen", help="the illumination: a halogen lamp (3100 K) or a white LED")
+    ap.add_argument("--wide", action="store_true", help="wider ranges for the camera's channels (a camera other than the XC10)")
+    ap.add_argument("--na", type=float, default=0.30, help="the objective's numerical aperture (default 0.30)")
     ap.add_argument("--same-settings", action="store_true",
                     help="all images were taken with identical exposure / white balance / lamp setting")
     args = ap.parse_args(argv)
+    import os
+    os.environ["FLAKEID_CAL_NA"] = repr(args.na)
 
     datasets = []
     for path, mat, ox in args.image:
@@ -156,7 +182,8 @@ def main(argv=None):
     # images of different oxide thickness taken with the same settings constrain the camera
     pairs = [(i, j) for i in range(len(datasets)) for j in range(len(datasets))
              if datasets[i][2] < datasets[j][2]] if args.same_settings else []
-    p, _ = fit(datasets, substrate_pairs=pairs, maxiter=args.maxiter, tone=args.tone, ccm=not args.no_ccm)
+    p, _ = fit(datasets, substrate_pairs=pairs, maxiter=args.maxiter, tone=args.tone, ccm=not args.no_ccm, led=args.lamp == "led",
+               wide=args.wide)
     cam = camera_from_params(p)
     oxides = {path: round(float(ox) * p[f"oxide_{i}"], 1) for i, (path, _, ox) in enumerate(args.image)}
     # graphite optical constants are only constrained by graphite images
@@ -165,7 +192,7 @@ def main(argv=None):
     extra = {"materials": mats,
         "calibration": {"images": args.image, "same_settings": args.same_settings, "fitted_oxide_nm": oxides,
                         "params": {k: round(float(v), 4) for k, v in p.items()}}}
-    save_profile(args.output, cam, na=0.30, notes=args.notes, extra=extra)
+    save_profile(args.output, cam, na=args.na, notes=args.notes, extra=extra)
     print(json.dumps(extra["calibration"], indent=2))
     print(f"wrote {args.output}")
 

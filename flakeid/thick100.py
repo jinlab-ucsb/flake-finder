@@ -73,9 +73,39 @@ LAYER_OXIDE_MAX = 150.0             # checked at ~84 nm oxide; thick oxide (rhom
 # Other materials: bx51_xc10_mm_raw16 (hBN-calibrated) at NA_100X, as before.
 PROFILE_100X = {"graphite": "bx51_xc10_mm_raw16_graphite_100x"}
 PROFILE_DEFAULT = "bx51_xc10_mm_raw16"
+
+
+def _own_profile_100x():
+    """Another microscope's own 100x hBN profile: environment FLAKEID_PROFILE_100X, else <FLAKEID_PROFILE_RAW>_100x
+    when that profile exists (the scan setting profile_raw; glovebox BX53M: bx53m_dp22_raw_led -> bx53m_dp22_raw_led_100x,
+    its white LED and DP22 camera through the 100x objective).  "" = the BX51's (PROFILE_DEFAULT)."""
+    import os
+    name = os.environ.get("FLAKEID_PROFILE_100X", "").strip()
+    raw = os.environ.get("FLAKEID_PROFILE_RAW", "").strip()
+    if not name and raw:
+        cand = Path(raw).stem + "_100x"
+        if (Path(__file__).resolve().parent / "profiles" / f"{cand}.json").is_file():
+            name = cand
+    return name
+
+
+def use_profile_100x(name):
+    """hBN at 100x read against the profile name (its camera, lamp and NA) instead of the BX51's.  Such a profile is
+    fitted at the chip's oxide, so the BX51's default oxide shift (+9 nm, OXIDE_SHIFT_DEFAULT) does not apply: 0; the
+    run's own shift (calibrate_oxide) is still tried.  Graphite keeps its profile (only hBN is set up there)."""
+    if not name:
+        return
+    PROFILE_100X["hbn"] = name
+    OXIDE_SHIFT_DEFAULT["hbn"] = 0.0
+    _CM.clear()
+    _MODELS.clear()
+    _LAYER_MODELS.clear()
+
+
 _MODELS = {}
 _LAYER_MODELS = {}
 _CM = {}
+use_profile_100x(_own_profile_100x())
 
 
 def model100(material, oxide_nm):
@@ -496,7 +526,12 @@ def main(argv=None):
     ap.add_argument("--oxide", action="store_true",
                     help="only refit the 100x thicknesses at the run's own 100x oxide from the colours already measured "
                          "(seconds), and bring the page up to date (the 100x score 0-1)")
+    ap.add_argument("--profile100", default="",
+                    help="the 100x hBN profile (e.g. bx53m_dp22_raw_led_100x on the glovebox BX53M; default: from the "
+                         "environment FLAKEID_PROFILE_100X / FLAKEID_PROFILE_RAW, else the BX51's)")
     a = ap.parse_args(argv)
+    use_profile_100x(a.profile100)
+    print(f"100x hBN profile: {PROFILE_100X.get('hbn', PROFILE_DEFAULT)} (default oxide shift {OXIDE_SHIFT_DEFAULT.get('hbn', 0):+g} nm)")
     for v in a.viewers:
         if a.oxide:
             recalibrate_page(v)
